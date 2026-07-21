@@ -107,6 +107,11 @@ one window turn the pause indefinite (halt) until `q fixed`/`q resume`.
 
 Other mechanics:
 
+- `q restart [id ...]` — SIGTERM the running job(s) and requeue **in place**
+  (same rank, retry counter untouched; not a failure). No ids = all running
+  jobs. Use after a code/config fix when you don't want to bounce the
+  scheduler or disturb the rest of the queue; SIGKILL after 10 s for jobs
+  that ignore SIGTERM.
 - Ctrl-C / SIGTERM / SIGHUP on the scheduler: running jobs are terminated and
   requeued. On the next `q run`, stale `running` rows are requeued (verified
   orphans from a SIGKILLed scheduler are killed first via /proc cmdline

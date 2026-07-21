@@ -47,7 +47,10 @@ def test_expand_cartesian_product() -> None:
 
 def test_expand_user_examples() -> None:
     argv = [
-        "uv", "run", "python", "scripts/train_predict.py",
+        "uv",
+        "run",
+        "python",
+        "scripts/train_predict.py",
         'features_transform.grouping=["Day","key"],["Day"]',
         'training_window="96"',
     ]
@@ -73,7 +76,9 @@ def test_empty_variant_raises() -> None:
 
 
 def test_no_expansion_is_single_job() -> None:
-    assert expand_sweep(["python", "train.py", "model=a"]) == [["python", "train.py", "model=a"]]
+    assert expand_sweep(["python", "train.py", "model=a"]) == [
+        ["python", "train.py", "model=a"]
+    ]
 
 
 if __name__ == "__main__":

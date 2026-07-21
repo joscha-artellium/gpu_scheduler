@@ -17,6 +17,8 @@ Commands:
     q status [--all]                              show the queue
     q logs <id> [-f]                              show/follow a job's log
     q cancel <id> [...]                           cancel queued/running jobs
+    q restart [id ...]                            terminate running jobs, requeue in
+                                                  place (no ids: all running jobs)
     q fixed <id> [...]                            "I fixed it": retry at FRONT of queue
     q extend [minutes]                            extend the failure pause (default 5)
     q resume                                      end the failure pause / halt now
@@ -101,20 +103,25 @@ from pathlib import Path
 from shutil import which
 from typing import IO, Any
 
-QSCHED_HOME = Path(os.environ.get("QSCHED_HOME", str(Path.home() / ".local/share/qsched")))
+QSCHED_HOME = Path(
+    os.environ.get("QSCHED_HOME", str(Path.home() / ".local/share/qsched"))
+)
 DB_PATH = QSCHED_HOME / "queue.db"
 LOG_DIR = QSCHED_HOME / "logs"
-NOTIFY_HOOK = Path(os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh")))
+NOTIFY_HOOK = Path(
+    os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh"))
+)
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "300"))
 HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "3"))
 POLL_SECONDS = float(os.environ.get("QSCHED_POLL_SECONDS", "2"))
 CANCEL_GRACE_SECONDS = 10.0
 
-ACTIVE_STATES = ("queued", "running", "canceling")
+ACTIVE_STATES = ("queued", "running", "canceling", "restarting")
 
 
 # --------------------------------------------------------------------------- db
+
 
 def db() -> sqlite3.Connection:
     QSCHED_HOME.mkdir(parents=True, exist_ok=True)
@@ -140,7 +147,9 @@ def db() -> sqlite3.Connection:
             log_path TEXT
         )"""
     )
-    conn.execute("CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
     conn.commit()
     return conn
 
@@ -217,6 +226,7 @@ def expand_sweep(argv: list[str]) -> list[list[str]]:
 
 # -------------------------------------------------------------------- submission
 
+
 def parse_env_pairs(pairs: list[str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for pair in pairs:
@@ -237,7 +247,9 @@ def insert_job(conn: sqlite3.Connection, argv: list[str], env: dict[str, str]) -
     return int(cur.lastrowid or 0)
 
 
-def resolve_failure_default(conn: sqlite3.Connection, job_id: int, exit_code: int, now: float) -> str:
+def resolve_failure_default(
+    conn: sqlite3.Connection, job_id: int, exit_code: int, now: float
+) -> str:
     """Unattended default, applied eagerly at failure time: back once, then failed."""
     row = conn.execute("SELECT retries FROM jobs WHERE id=?", (job_id,)).fetchone()
     if int(row["retries"]) == 0:
@@ -274,7 +286,9 @@ def cmd_add(env_pairs: list[str], command: list[str]) -> None:
 
 def cmd_sweep(env_pairs: list[str], command: list[str], dry_run: bool) -> None:
     if not command:
-        raise SystemExit("no command given (usage: q sweep [--env K=V] [-n] -- cmd ...)")
+        raise SystemExit(
+            "no command given (usage: q sweep [--env K=V] [-n] -- cmd ...)"
+        )
     combos = expand_sweep(command)
     if dry_run:
         for combo in combos:
@@ -289,16 +303,24 @@ def cmd_sweep(env_pairs: list[str], command: list[str], dry_run: bool) -> None:
 
 # ------------------------------------------------------------------ notifications
 
+
 def notify(title: str, body: str) -> None:
     try:
         if NOTIFY_HOOK.is_file() and os.access(NOTIFY_HOOK, os.X_OK):
             subprocess.run([str(NOTIFY_HOOK), title, body], timeout=30, check=False)
             return
         if which("notify-send"):
-            subprocess.run(["notify-send", "-u", "critical", title, body], timeout=10, check=False)
+            subprocess.run(
+                ["notify-send", "-u", "critical", title, body], timeout=10, check=False
+            )
         email = os.environ.get("QSCHED_EMAIL")
         if email and which("mail"):
-            subprocess.run(["mail", "-s", title, email], input=body.encode(), timeout=30, check=False)
+            subprocess.run(
+                ["mail", "-s", title, email],
+                input=body.encode(),
+                timeout=30,
+                check=False,
+            )
     except Exception as exc:  # notification failure must never take down dispatch
         print(f"[qsched] notify failed: {exc}", file=sys.stderr)
 
@@ -312,6 +334,7 @@ def log_tail(path: Path, max_bytes: int = 800) -> str:
 
 
 # --------------------------------------------------------------------- scheduler
+
 
 @dataclass
 class RunningJob:
@@ -342,7 +365,7 @@ class Scheduler:
     # -- startup ------------------------------------------------------------
     def cleanup_stale(self) -> None:
         rows = self.conn.execute(
-            "SELECT * FROM jobs WHERE state IN ('running','canceling')"
+            "SELECT * FROM jobs WHERE state IN ('running','canceling','restarting')"
         ).fetchall()
         for row in rows:
             pid = row["pid"]
@@ -386,7 +409,7 @@ class Scheduler:
                 (gpu, time.time(), str(log_path), job_id),
             )
             self.conn.commit()
-            self.finalize(job_id, exit_code=127, was_canceling=False, log_path=log_path)
+            self.finalize(job_id, exit_code=127, log_path=log_path)
             return
         self.conn.execute(
             "UPDATE jobs SET state='running', gpu=?, pid=?, started_at=?, log_path=? WHERE id=?",
@@ -412,15 +435,25 @@ class Scheduler:
             busy.add(gpu)
 
     # -- reaping / failure path ----------------------------------------------
-    def finalize(self, job_id: int, exit_code: int, was_canceling: bool, log_path: Path) -> None:
+    def finalize(self, job_id: int, exit_code: int, log_path: Path) -> None:
         now = time.time()
-        if was_canceling:
+        state = self._state(job_id)
+        if state == "canceling":
             self.conn.execute(
                 "UPDATE jobs SET state='canceled', exit_code=?, finished_at=?, pid=NULL WHERE id=?",
                 (exit_code, now, job_id),
             )
             self.conn.commit()
             self.event(f"job {job_id} canceled")
+            return
+        if state == "restarting":  # requeue in place; not a failure
+            self.conn.execute(
+                "UPDATE jobs SET state='queued', gpu=NULL, pid=NULL, started_at=NULL, "
+                "finished_at=NULL, exit_code=NULL WHERE id=?",
+                (job_id,),
+            )
+            self.conn.commit()
+            self.event(f"job {job_id} terminated for restart — requeued in place")
             return
         if exit_code == 0:
             self.conn.execute(
@@ -431,7 +464,9 @@ class Scheduler:
             self.event(f"job {job_id} done")
             return
         outcome = resolve_failure_default(self.conn, job_id, exit_code, now)
-        self.event(f"job {job_id} exited {exit_code} — {outcome} (override with `q fixed {job_id}`)")
+        self.event(
+            f"job {job_id} exited {exit_code} — {outcome} (override with `q fixed {job_id}`)"
+        )
         self.register_failure(job_id, exit_code, outcome, log_path, now)
 
     def register_failure(
@@ -445,7 +480,9 @@ class Scheduler:
             ctl_set(self.conn, "window_failures", str(window_failures))
             if window_failures >= HALT_AFTER:
                 ctl_set(self.conn, "halted", "1")
-                self.event(f"{window_failures} failures in one window — dispatch HALTED")
+                self.event(
+                    f"{window_failures} failures in one window — dispatch HALTED"
+                )
                 notify(
                     "qsched: dispatch halted",
                     f"{window_failures} job failures within one pause window; dispatch stopped "
@@ -455,7 +492,9 @@ class Scheduler:
             return
         ctl_set(self.conn, "pause_until", str(now + PAUSE_SECONDS))
         ctl_set(self.conn, "window_failures", "1")
-        row = self.conn.execute("SELECT argv FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT argv FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         argv: list[str] = json.loads(row["argv"])
         self.event(f"dispatch paused for {PAUSE_SECONDS:.0f}s")
         notify(
@@ -473,22 +512,26 @@ class Scheduler:
             if exit_code is None:
                 continue
             rj.log_file.close()
-            was_canceling = rj.kill_deadline is not None or self._state(job_id) == "canceling"
             del self.running[job_id]
-            self.finalize(job_id, exit_code, was_canceling, rj.log_path)
+            self.finalize(job_id, exit_code, rj.log_path)
 
     def _state(self, job_id: int) -> str:
-        row = self.conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT state FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         return str(row["state"]) if row else "?"
 
-    def process_cancel_requests(self, now: float) -> None:
-        rows = self.conn.execute("SELECT id FROM jobs WHERE state='canceling'").fetchall()
+    def process_termination_requests(self, now: float) -> None:
+        rows = self.conn.execute(
+            "SELECT id, state FROM jobs WHERE state IN ('canceling','restarting')"
+        ).fetchall()
         for row in rows:
             rj = self.running.get(int(row["id"]))
             if rj is None:
                 continue
             if rj.kill_deadline is None:
-                self.event(f"canceling job {rj.job_id} (SIGTERM)")
+                verb = "canceling" if row["state"] == "canceling" else "restarting"
+                self.event(f"{verb} job {rj.job_id} (SIGTERM)")
                 _kill_process_group(rj.proc.pid, signal.SIGTERM)
                 rj.kill_deadline = now + CANCEL_GRACE_SECONDS
             elif now > rj.kill_deadline:
@@ -497,7 +540,9 @@ class Scheduler:
     # -- shutdown -------------------------------------------------------------
     def shutdown(self) -> None:
         if self.running:
-            self.event(f"shutting down — terminating {len(self.running)} running job(s)")
+            self.event(
+                f"shutting down — terminating {len(self.running)} running job(s)"
+            )
         for rj in self.running.values():
             _kill_process_group(rj.proc.pid, signal.SIGTERM)
         deadline = time.time() + 5.0
@@ -532,7 +577,7 @@ class Scheduler:
             while not self.stop_requested:
                 now = time.time()
                 self.reap()
-                self.process_cancel_requests(now)
+                self.process_termination_requests(now)
                 self.dispatch(now)
                 slept = 0.0
                 while slept < POLL_SECONDS and not self.stop_requested:
@@ -579,6 +624,7 @@ def cmd_run(gpus: list[int]) -> None:
 
 # ---------------------------------------------------------------- status & friends
 
+
 def _format_age(seconds: float) -> str:
     if seconds < 90:
         return f"{seconds:.0f}s"
@@ -618,7 +664,9 @@ def cmd_status(show_all: bool) -> None:
         command = shlex.join(argv)
         command = command if len(command) <= 90 else command[:87] + "..."
         gpu = row["gpu"] if row["gpu"] is not None else "-"
-        print(f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} {runtime:>6}  {command}")
+        print(
+            f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} {runtime:>6}  {command}"
+        )
 
 
 def cmd_logs(job_id: int, follow: bool) -> None:
@@ -660,10 +708,40 @@ def cmd_cancel(job_ids: list[int]) -> None:
     conn.commit()
 
 
+def cmd_restart(job_ids: list[int]) -> None:
+    conn = db()
+    if not job_ids:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE state='running' ORDER BY id"
+        ).fetchall()
+        job_ids = [int(r["id"]) for r in rows]
+        if not job_ids:
+            print("no running jobs")
+            return
+    for job_id in job_ids:
+        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            print(f"job {job_id}: not found")
+        elif row["state"] == "running":
+            conn.execute("UPDATE jobs SET state='restarting' WHERE id=?", (job_id,))
+            print(
+                f"job {job_id}: restart requested (scheduler will SIGTERM and requeue)"
+            )
+        elif row["state"] in ("restarting", "queued"):
+            print(f"job {job_id}: already {row['state']}, will (re)run")
+        else:
+            print(
+                f"job {job_id}: state {row['state']} — use `q fixed`/`q requeue-failed` instead"
+            )
+    conn.commit()
+
+
 def cmd_fixed(job_ids: list[int]) -> None:
     conn = db()
     for job_id in job_ids:  # first listed gets the lowest rank -> runs first
-        row = conn.execute("SELECT state, retries FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = conn.execute(
+            "SELECT state, retries FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         if row is None:
             print(f"job {job_id}: not found")
             continue
@@ -675,7 +753,9 @@ def cmd_fixed(job_ids: list[int]) -> None:
             "started_at=NULL, finished_at=NULL, exit_code=NULL WHERE id=?",
             (front_rank(conn), job_id),
         )
-        print(f"job {job_id}: requeued at front (unattended retries used: {row['retries']})")
+        print(
+            f"job {job_id}: requeued at front (unattended retries used: {row['retries']})"
+        )
     conn.commit()
     clear_pause(conn)
     print("dispatch resumed")
@@ -687,7 +767,9 @@ def cmd_extend(minutes: float) -> None:
     base = max(now, float(ctl_get(conn, "pause_until", "0")))
     ctl_set(conn, "pause_until", str(base + minutes * 60))
     ctl_set(conn, "halted", "0")  # a halt becomes a timed pause
-    print(f"pause extended until {time.strftime('%H:%M:%S', time.localtime(base + minutes * 60))}")
+    print(
+        f"pause extended until {time.strftime('%H:%M:%S', time.localtime(base + minutes * 60))}"
+    )
 
 
 def cmd_resume() -> None:
@@ -698,7 +780,9 @@ def cmd_resume() -> None:
 
 def cmd_requeue_failed() -> None:
     conn = db()
-    rows = conn.execute("SELECT id FROM jobs WHERE state='failed' ORDER BY id").fetchall()
+    rows = conn.execute(
+        "SELECT id FROM jobs WHERE state='failed' ORDER BY id"
+    ).fetchall()
     for row in rows:
         conn.execute(
             "UPDATE jobs SET state='queued', retries=0, rank=?, gpu=NULL, pid=NULL, "
@@ -710,6 +794,7 @@ def cmd_requeue_failed() -> None:
 
 
 # ------------------------------------------------------------------------- main
+
 
 def _split_at_double_dash(args: list[str]) -> tuple[list[str], list[str]]:
     if "--" not in args:
@@ -729,7 +814,9 @@ def main(argv: list[str] | None = None) -> None:
     p_add = sub.add_parser("add", help="enqueue one job (command after --)")
     p_add.add_argument("--env", action="append", default=[], metavar="K=V")
 
-    p_sweep = sub.add_parser("sweep", help="expand comma sweeps, enqueue jobs (command after --)")
+    p_sweep = sub.add_parser(
+        "sweep", help="expand comma sweeps, enqueue jobs (command after --)"
+    )
     p_sweep.add_argument("--env", action="append", default=[], metavar="K=V")
     p_sweep.add_argument("-n", "--dry-run", action="store_true")
 
@@ -746,7 +833,16 @@ def main(argv: list[str] | None = None) -> None:
     p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
     p_cancel.add_argument("job_ids", type=int, nargs="+")
 
-    p_fixed = sub.add_parser("fixed", help="mark failure fixed: retry at front of queue")
+    p_restart = sub.add_parser(
+        "restart", help="terminate running jobs and requeue in place"
+    )
+    p_restart.add_argument(
+        "job_ids", type=int, nargs="*", help="default: all running jobs"
+    )
+
+    p_fixed = sub.add_parser(
+        "fixed", help="mark failure fixed: retry at front of queue"
+    )
     p_fixed.add_argument("job_ids", type=int, nargs="+")
 
     p_extend = sub.add_parser("extend", help="extend the failure pause")
@@ -769,6 +865,8 @@ def main(argv: list[str] | None = None) -> None:
             cmd_logs(ns.job_id, ns.follow)
         case "cancel":
             cmd_cancel(ns.job_ids)
+        case "restart":
+            cmd_restart(ns.job_ids)
         case "fixed":
             cmd_fixed(ns.job_ids)
         case "extend":
