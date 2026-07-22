@@ -50,14 +50,14 @@ the training script directly. Therefore:
   **top-level commas** (commas outside `()`, `[]`, `{}`, `'…'`, `"…"`) into
   sweep variants; the cartesian product over all tokens is enqueued.
 
-| You type (bash) | hydra receives | sweep variants |
-|---|---|---|
-| `'training_window="96"'` | `training_window="96"` | 1 |
-| `lr=0.1,0.01` | — | 2 |
-| `'features_transform.grouping=["Day","key"],["Day"]'` | — | 2: `["Day","key"]` and `["Day"]` |
-| `'key=[a,b]'` | `key=[a,b]` | 1 (commas bracketed) |
-| `'key="a,b"'` | `key="a,b"` | 1 (comma quoted) |
-| `model=a,b lr=0.1,0.01` | — | 4 (product) |
+| You type (bash)                                       | hydra receives         | sweep variants                   |
+|-------------------------------------------------------|------------------------|----------------------------------|
+| `'training_window="96"'`                              | `training_window="96"` | 1                                |
+| `lr=0.1,0.01`                                         | —                      | 2                                |
+| `'features_transform.grouping=["Day","key"],["Day"]'` | —                      | 2: `["Day","key"]` and `["Day"]` |
+| `'key=[a,b]'`                                         | `key=[a,b]`            | 1 (commas bracketed)             |
+| `'key="a,b"'`                                         | `key="a,b"`            | 1 (comma quoted)                 |
+| `model=a,b lr=0.1,0.01`                               | —                      | 4 (product)                      |
 
 Not interpreted / not supported:
 
@@ -147,14 +147,14 @@ The body includes the command, log path, and the log tail.
 
 ## Tunables (env vars)
 
-| var | default | |
-|---|---|---|
-| `QSCHED_HOME` | `~/.local/share/qsched` | db + logs |
-| `QSCHED_PAUSE_SECONDS` | 300 | pause after a failure |
-| `QSCHED_HALT_AFTER` | 3 | failures per window before halt |
-| `QSCHED_POLL_SECONDS` | 2 | scheduler poll interval |
-| `QSCHED_NOTIFY` | `~/.config/qsched/notify.sh` | hook path |
-| `QSCHED_EMAIL` | unset | enables mail fallback |
+| var                    | default                      |                                 |
+|------------------------|------------------------------|---------------------------------|
+| `QSCHED_HOME`          | `~/.local/share/qsched`      | db + logs                       |
+| `QSCHED_PAUSE_SECONDS` | 300                          | pause after a failure           |
+| `QSCHED_HALT_AFTER`    | 3                            | failures per window before halt |
+| `QSCHED_POLL_SECONDS`  | 2                            | scheduler poll interval         |
+| `QSCHED_NOTIFY`        | `~/.config/qsched/notify.sh` | hook path                       |
+| `QSCHED_EMAIL`         | unset                        | enables mail fallback           |
 
 ## Tests
 

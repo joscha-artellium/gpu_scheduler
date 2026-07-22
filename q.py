@@ -261,7 +261,8 @@ def resolve_failure_default(
         outcome = "requeued at back"
     else:
         conn.execute(
-            "UPDATE jobs SET state='failed', exit_code=?, finished_at=?, gpu=NULL, pid=NULL "
+            "UPDATE jobs "
+            "SET state='failed', exit_code=?, finished_at=?, gpu=NULL, pid=NULL "
             "WHERE id=?",
             (exit_code, now, job_id),
         )
@@ -374,7 +375,8 @@ class Scheduler:
                 _kill_process_group(int(pid))
             new_state = "canceled" if row["state"] == "canceling" else "queued"
             self.conn.execute(
-                "UPDATE jobs SET state=?, gpu=NULL, pid=NULL, started_at=NULL WHERE id=?",
+                "UPDATE jobs "
+                "SET state=?, gpu=NULL, pid=NULL, started_at=NULL WHERE id=?",
                 (new_state, row["id"]),
             )
             if new_state == "queued":
@@ -405,14 +407,16 @@ class Scheduler:
             log_file.write(f"== spawn failed: {exc}\n".encode())
             log_file.close()
             self.conn.execute(
-                "UPDATE jobs SET state='running', gpu=?, started_at=?, log_path=? WHERE id=?",
+                "UPDATE jobs "
+                "SET state='running', gpu=?, started_at=?, log_path=? WHERE id=?",
                 (gpu, time.time(), str(log_path), job_id),
             )
             self.conn.commit()
             self.finalize(job_id, exit_code=127, log_path=log_path)
             return
         self.conn.execute(
-            "UPDATE jobs SET state='running', gpu=?, pid=?, started_at=?, log_path=? WHERE id=?",
+            "UPDATE jobs "
+            "SET state='running', gpu=?, pid=?, started_at=?, log_path=? WHERE id=?",
             (gpu, proc.pid, time.time(), str(log_path), job_id),
         )
         self.conn.commit()
@@ -440,7 +444,8 @@ class Scheduler:
         state = self._state(job_id)
         if state == "canceling":
             self.conn.execute(
-                "UPDATE jobs SET state='canceled', exit_code=?, finished_at=?, pid=NULL WHERE id=?",
+                "UPDATE jobs "
+                "SET state='canceled', exit_code=?, finished_at=?, pid=NULL WHERE id=?",
                 (exit_code, now, job_id),
             )
             self.conn.commit()
@@ -457,7 +462,8 @@ class Scheduler:
             return
         if exit_code == 0:
             self.conn.execute(
-                "UPDATE jobs SET state='done', exit_code=0, finished_at=?, pid=NULL WHERE id=?",
+                "UPDATE jobs "
+                "SET state='done', exit_code=0, finished_at=?, pid=NULL WHERE id=?",
                 (now, job_id),
             )
             self.conn.commit()
@@ -465,7 +471,8 @@ class Scheduler:
             return
         outcome = resolve_failure_default(self.conn, job_id, exit_code, now)
         self.event(
-            f"job {job_id} exited {exit_code} — {outcome} (override with `q fixed {job_id}`)"
+            f"job {job_id} exited {exit_code} — {outcome} "
+            f"(override with `q fixed {job_id}`)"
         )
         self.register_failure(job_id, exit_code, outcome, log_path, now)
 
@@ -485,8 +492,8 @@ class Scheduler:
                 )
                 notify(
                     "qsched: dispatch halted",
-                    f"{window_failures} job failures within one pause window; dispatch stopped "
-                    f"until `q fixed <id> [...]` or `q resume`.\n"
+                    f"{window_failures} job failures within one pause window; "
+                    f"dispatch stopped until `q fixed <id> [...]` or `q resume`.\n"
                     f"Latest: job {job_id} (exit {exit_code}), {outcome}.",
                 )
             return
@@ -500,7 +507,8 @@ class Scheduler:
         notify(
             f"qsched: job {job_id} failed (exit {exit_code})",
             f"cmd: {shlex.join(argv)}\nlog: {log_path}\n"
-            f"Default applied: {outcome}. Dispatch paused {PAUSE_SECONDS / 60:.0f} min.\n"
+            f"Default applied: {outcome}. "
+            f"Dispatch paused {PAUSE_SECONDS / 60:.0f} min.\n"
             f"  `q fixed {job_id}` -> retry at FRONT instead\n"
             f"  `q extend [min]`   -> more time before dispatch resumes\n\n"
             f"--- log tail ---\n{log_tail(log_path)}",
@@ -665,7 +673,8 @@ def cmd_status(show_all: bool) -> None:
         command = command if len(command) <= 90 else command[:87] + "..."
         gpu = row["gpu"] if row["gpu"] is not None else "-"
         print(
-            f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} {runtime:>6}  {command}"
+            f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} "
+            f"{runtime:>6}  {command}"
         )
 
 
@@ -731,7 +740,8 @@ def cmd_restart(job_ids: list[int]) -> None:
             print(f"job {job_id}: already {row['state']}, will (re)run")
         else:
             print(
-                f"job {job_id}: state {row['state']} — use `q fixed`/`q requeue-failed` instead"
+                f"job {job_id}: state {row['state']} — "
+                f"use `q fixed`/`q requeue-failed` instead"
             )
     conn.commit()
 
@@ -754,7 +764,8 @@ def cmd_fixed(job_ids: list[int]) -> None:
             (front_rank(conn), job_id),
         )
         print(
-            f"job {job_id}: requeued at front (unattended retries used: {row['retries']})"
+            f"job {job_id}: requeued at front "
+            f"(unattended retries used: {row['retries']})"
         )
     conn.commit()
     clear_pause(conn)
@@ -767,9 +778,8 @@ def cmd_extend(minutes: float) -> None:
     base = max(now, float(ctl_get(conn, "pause_until", "0")))
     ctl_set(conn, "pause_until", str(base + minutes * 60))
     ctl_set(conn, "halted", "0")  # a halt becomes a timed pause
-    print(
-        f"pause extended until {time.strftime('%H:%M:%S', time.localtime(base + minutes * 60))}"
-    )
+    time_tuple = time.localtime(base + minutes * 60)
+    print(f"pause extended until {time.strftime('%H:%M:%S', time_tuple)}")
 
 
 def cmd_resume() -> None:
@@ -821,7 +831,7 @@ def main(argv: list[str] | None = None) -> None:
     p_sweep.add_argument("-n", "--dry-run", action="store_true")
 
     p_run = sub.add_parser("run", help="start the scheduler (foreground)")
-    p_run.add_argument("--gpus", default="0,1,2", help="comma-separated GPU ids")
+    p_run.add_argument("--gpus", default="0,2,1", help="comma-separated GPU ids")
 
     p_status = sub.add_parser("status", help="show the queue")
     p_status.add_argument("--all", action="store_true")
