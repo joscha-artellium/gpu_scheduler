@@ -678,6 +678,16 @@ def cmd_status(show_all: bool) -> None:
         )
 
 
+def cmd_show(job_id: int) -> None:
+    conn = db()
+    row = conn.execute("SELECT argv FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        print(f"no such job: {job_id}", file=sys.stderr)
+        raise SystemExit(1)
+    argv: list[str] = json.loads(row["argv"])
+    print(shlex.join(argv))
+
+
 def cmd_logs(job_id: int, follow: bool) -> None:
     conn = db()
     row = conn.execute("SELECT log_path FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -840,6 +850,9 @@ def main(argv: list[str] | None = None) -> None:
     p_logs.add_argument("job_id", type=int)
     p_logs.add_argument("-f", "--follow", action="store_true")
 
+    p_logs = sub.add_parser("show", help="print a job's command")
+    p_logs.add_argument("job_id", type=int)
+
     p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
     p_cancel.add_argument("job_ids", type=int, nargs="+")
 
@@ -871,6 +884,8 @@ def main(argv: list[str] | None = None) -> None:
             cmd_run([int(g) for g in str(ns.gpus).split(",") if g != ""])
         case "status":
             cmd_status(ns.all)
+        case "show":
+            cmd_show(ns.job_id)
         case "logs":
             cmd_logs(ns.job_id, ns.follow)
         case "cancel":
