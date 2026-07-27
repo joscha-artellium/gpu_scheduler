@@ -112,7 +112,7 @@ NOTIFY_HOOK = Path(
     os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh"))
 )
 
-PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "300"))
+PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
 HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "3"))
 POLL_SECONDS = float(os.environ.get("QSCHED_POLL_SECONDS", "2"))
 CANCEL_GRACE_SECONDS = 10.0
@@ -695,16 +695,30 @@ def cmd_logs(job_id: int, follow: bool) -> None:
         raise SystemExit(f"no log for job {job_id}")
     path = Path(row["log_path"])
     print(f"-- {path}", file=sys.stderr)
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read()
-            if chunk:
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
-            elif follow:
-                time.sleep(0.5)
-            else:
-                break
+
+    out = sys.stdout.buffer
+    last = b"\n"
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(65536)
+                if chunk:
+                    last = chunk[-1:]
+                    out.write(chunk)
+                    out.flush()
+                elif follow:
+                    time.sleep(0.5)
+                else:
+                    break
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(141)
+
+    if last != b"\n" and sys.stdout.isatty():
+        out.write(b"\n")
+        out.flush()
 
 
 def cmd_cancel(job_ids: list[int]) -> None:
