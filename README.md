@@ -28,7 +28,7 @@ q run                                # scheduler for GPUs 0,1,2 (--gpus to chang
 # anywhere else, any time — your submission scripts become lists of these:
 q sweep --env REGION=US3 -- uv run python scripts/train_predict.py \
     model=xgb01,xgb02 'training_window="96"'
-q status
+q status                             # counts, queue, and a live ETA per running job
 q logs 17 -f                         # follow a job's progress bars
 ```
 
@@ -81,6 +81,15 @@ The submission-time working directory is recorded per job and the job runs
 in it, so relative paths (`scripts/…`, hydra config dirs) behave as if you
 had launched from where you typed `q add`.
 
+## Status
+
+`q status` prints a count line (`queued 41 · running 3 · done 38 · failed 2`),
+then the last 5 finished jobs plus everything active (`--all` for the lot).
+For running jobs the `ETA` column parses the **last tqdm bar** in the tail of
+the log (`83% 58m`). Caveats: with nested bars that's the innermost loop, not
+the job; bars without a total (`38it [03:13, ...]`) and bars that haven't
+produced an estimate yet show `-`.
+
 ## Scheduling & failure semantics
 
 Dispatch is FIFO by queue rank; each job gets `CUDA_VISIBLE_DEVICES=<gpu>`.
@@ -101,17 +110,36 @@ can override the default:
 3. **Do nothing** — the pause expires and dispatch resumes; the default is
    already in place. (`q fixed` still works later.)
 
-Guard rails: pauses don't stack, and 3 failures (`QSCHED_HALT_AFTER`) within
-one window turn the pause indefinite (halt) until `q fixed`/`q resume`.
-`q resume` ends any pause/halt immediately. Cancels never count as failures.
+Guard rails: pauses don't stack, and behind them sits a circuit breaker —
+`QSCHED_HALT_AFTER` (default 12, `0` disables) **consecutive** failures with no
+job exiting 0 in between turn the pause indefinite (halt). Any successful job
+resets the streak, so a long sweep with the odd OOM never halts, while a bad
+commit that kills every job stops the queue after 12 instead of burning 200.
+`q fixed`/`q resume` clear a halt; `q extend` converts it back to a timed pause
+and resets the streak. Cancels never count as failures.
 
 Other mechanics:
 
-- `q restart [id ...]` — SIGTERM the running job(s) and requeue **in place**
-  (same rank, retry counter untouched; not a failure). No ids = all running
-  jobs. Use after a code/config fix when you don't want to bounce the
-  scheduler or disturb the rest of the queue; SIGKILL after 10 s for jobs
-  that ignore SIGTERM.
+- `q restart <id> ...` — SIGTERM the running job(s) and requeue **in place**
+  (same rank, retry counter untouched; not a failure). Use after a code/config
+  fix when you don't want to bounce the scheduler or disturb the rest of the
+  queue; SIGKILL after 10 s for jobs that ignore SIGTERM. `q restart --all`
+  does this for every running job — the ids are required otherwise, since this
+  throws away in-flight progress on every GPU. It only ever touches `running`
+  jobs: nothing you cancelled or that already failed is resurrected by it.
+- `q cancel <id> ...` — queued jobs go straight to `canceled`; running jobs get
+  SIGTERM (then SIGKILL after 10 s). Never counted as a failure, never triggers
+  a pause. A cancel is final: use `q fixed` (failed jobs) or resubmit by hand.
+- `q front <id> ...` / `q back <id> ...` — reorder **queued** jobs; the listed
+  order is preserved. Same for the ids you pass `q fixed`.
+- `q show <id>` — prints `cwd:` / `env:` / `cmd:` for a job; `q show <id> -r`
+  prints a paste-able `q add` line (prefixed with `cd <cwd> &&` when you are
+  somewhere else), which is how you resurrect a cancelled job.
+- `q clear` — delete finished (`done`/`failed`/`canceled`) jobs and their log
+  files; `--older-than DAYS` scopes it, `-n` shows what would go. `q clear
+  --all` wipes the queue and restarts ids at 1, and refuses while a scheduler
+  holds the lock. Log files always follow the db: any `logs/<id>.log` without a
+  matching row is removed too.
 - Ctrl-C / SIGTERM / SIGHUP on the scheduler: running jobs are terminated and
   requeued. On the next `q run`, stale `running` rows are requeued (verified
   orphans from a SIGKILLed scheduler are killed first via /proc cmdline
@@ -126,7 +154,10 @@ against), and nothing contains a job that ignores `CUDA_VISIBLE_DEVICES`.
 
 ## Notifications
 
-On failure/halt the scheduler runs, in order of preference:
+You get a notification on failure, on halt, and once per batch when the queue
+drains (the last running job finishes and nothing is queued) with the tally —
+`2 done, 1 failed` plus the failed ids. The scheduler runs, in order of
+preference:
 
 1. `~/.config/qsched/notify.sh <title> <body>` if present+executable
    (override path with `QSCHED_NOTIFY`), else
@@ -151,7 +182,7 @@ The body includes the command, log path, and the log tail.
 |------------------------|------------------------------|---------------------------------|
 | `QSCHED_HOME`          | `~/.local/share/qsched`      | db + logs                       |
 | `QSCHED_PAUSE_SECONDS` | 300                          | pause after a failure           |
-| `QSCHED_HALT_AFTER`    | 3                            | failures per window before halt |
+| `QSCHED_HALT_AFTER`    | 12                           | consecutive failures before halt (0 = never) |
 | `QSCHED_POLL_SECONDS`  | 2                            | scheduler poll interval         |
 | `QSCHED_NOTIFY`        | `~/.config/qsched/notify.sh` | hook path                       |
 | `QSCHED_EMAIL`         | unset                        | enables mail fallback           |

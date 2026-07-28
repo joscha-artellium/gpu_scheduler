@@ -16,13 +16,16 @@ Commands:
     q run   [--gpus 0,1,2]                        start the scheduler
     q status [--all]                              show the queue
     q logs <id> [-f]                              show/follow a job's log
+    q show <id> [-r]                              print cmd/env/cwd (-r: q add line)
     q cancel <id> [...]                           cancel queued/running jobs
-    q restart [id ...]                            terminate running jobs, requeue in
-                                                  place (no ids: all running jobs)
+    q restart <id> [...] | --all                  terminate running jobs, requeue in
+                                                  place (--all: every running job)
+    q front|back <id> [...]                       move queued jobs in the queue
     q fixed <id> [...]                            "I fixed it": retry at FRONT of queue
     q extend [minutes]                            extend the failure pause (default 5)
     q resume                                      end the failure pause / halt now
     q requeue-failed                              re-enqueue all failed jobs (back)
+    q clear [--older-than DAYS] [--all] [-n]      delete finished jobs + their logs
 
 QUOTING RULES
 =============
@@ -74,9 +77,13 @@ the pause you can override the default:
   3. Do nothing — the pause expires and dispatch resumes; the default
      disposition is already in place.
 
-Pauses do not stack; if QSCHED_HALT_AFTER (default 3) failures land within
-one window the pause becomes indefinite (halt) until `q fixed`/`q resume`.
-Cancels never count as failures.
+Pauses do not stack. A circuit breaker sits behind them: QSCHED_HALT_AFTER
+(default 12, 0 disables) *consecutive* failures — no job exiting 0 in between —
+make the pause indefinite (halt) until `q fixed`/`q resume`/`q extend`. Any
+successful job resets the streak. Cancels never count as failures.
+
+When the last running job finishes and nothing is queued, the scheduler sends
+one "queue drained" notification with the tally for that batch.
 
 On scheduler shutdown (Ctrl-C / SIGTERM / SIGHUP) running jobs are terminated
 and requeued in place — with an idempotent framework a rerun skips completed
@@ -103,29 +110,46 @@ from pathlib import Path
 from shutil import which
 from typing import IO, Any
 
-QSCHED_HOME = Path(
-    os.environ.get("QSCHED_HOME", str(Path.home() / ".local/share/qsched"))
-)
-DB_PATH = QSCHED_HOME / "queue.db"
-LOG_DIR = QSCHED_HOME / "logs"
-NOTIFY_HOOK = Path(
-    os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh"))
-)
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
-HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "3"))
+HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "12"))  # 0 disables halting
 POLL_SECONDS = float(os.environ.get("QSCHED_POLL_SECONDS", "2"))
 CANCEL_GRACE_SECONDS = 10.0
 
+
+def qsched_home() -> Path:
+    return Path(os.environ.get("QSCHED_HOME", str(Path.home() / ".local/share/qsched")))
+
+
+def db_path() -> Path:
+    return qsched_home() / "queue.db"
+
+
+def log_dir() -> Path:
+    return qsched_home() / "logs"
+
+
+def lock_path() -> Path:
+    return qsched_home() / "scheduler.lock"
+
+
+def notify_hook() -> Path:
+    return Path(
+        os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh"))
+    )
+
+
 ACTIVE_STATES = ("queued", "running", "canceling", "restarting")
+TERMINAL_STATES = ("done", "failed", "canceled")
+STATE_ORDER = (*ACTIVE_STATES, *TERMINAL_STATES)
 
 
 # --------------------------------------------------------------------------- db
 
 
 def db() -> sqlite3.Connection:
-    QSCHED_HOME.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    qsched_home().mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path(), timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
@@ -274,7 +298,7 @@ def resolve_failure_default(
 def clear_pause(conn: sqlite3.Connection) -> None:
     ctl_set(conn, "pause_until", "0")
     ctl_set(conn, "halted", "0")
-    ctl_set(conn, "window_failures", "0")
+    ctl_set(conn, "fail_streak", "0")
 
 
 def cmd_add(env_pairs: list[str], command: list[str]) -> None:
@@ -307,8 +331,9 @@ def cmd_sweep(env_pairs: list[str], command: list[str], dry_run: bool) -> None:
 
 def notify(title: str, body: str) -> None:
     try:
-        if NOTIFY_HOOK.is_file() and os.access(NOTIFY_HOOK, os.X_OK):
-            subprocess.run([str(NOTIFY_HOOK), title, body], timeout=30, check=False)
+        hook = notify_hook()
+        if hook.is_file() and os.access(hook, os.X_OK):
+            subprocess.run([str(hook), title, body], timeout=30, check=False)
             return
         if which("notify-send"):
             subprocess.run(
@@ -353,6 +378,7 @@ class Scheduler:
     gpus: list[int]
     running: dict[int, RunningJob] = field(default_factory=dict)
     stop_requested: bool = False
+    batch_started_at: float | None = None  # set on first spawn after a drain
 
     # -- helpers ------------------------------------------------------------
     def event(self, message: str) -> None:
@@ -388,8 +414,9 @@ class Scheduler:
         job_id = int(row["id"])
         argv: list[str] = json.loads(row["argv"])
         job_env: dict[str, str] = json.loads(row["env"])
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOG_DIR / f"{job_id}.log"
+        logs = log_dir()
+        logs.mkdir(parents=True, exist_ok=True)
+        log_path = logs / f"{job_id}.log"
         log_file: IO[bytes] = open(log_path, "ab", buffering=0)
         env = {**os.environ, **job_env, "CUDA_VISIBLE_DEVICES": str(gpu)}
         header = f"== qsched job {job_id} on gpu {gpu} :: {shlex.join(argv)}\n"
@@ -421,6 +448,8 @@ class Scheduler:
         )
         self.conn.commit()
         self.running[job_id] = RunningJob(job_id, gpu, proc, log_file, log_path)
+        if self.batch_started_at is None:
+            self.batch_started_at = time.time()
         self.event(f"job {job_id} started on gpu {gpu}: {shlex.join(argv)}")
 
     def dispatch(self, now: float) -> None:
@@ -467,6 +496,7 @@ class Scheduler:
                 (now, job_id),
             )
             self.conn.commit()
+            ctl_set(self.conn, "fail_streak", "0")  # circuit breaker: success resets
             self.event(f"job {job_id} done")
             return
         outcome = resolve_failure_default(self.conn, job_id, exit_code, now)
@@ -479,26 +509,26 @@ class Scheduler:
     def register_failure(
         self, job_id: int, exit_code: int, outcome: str, log_path: Path, now: float
     ) -> None:
-        if ctl_get(self.conn, "halted", "0") == "1":
+        streak = int(ctl_get(self.conn, "fail_streak", "0")) + 1
+        ctl_set(self.conn, "fail_streak", str(streak))
+        already_halted = ctl_get(self.conn, "halted", "0") == "1"
+        if HALT_AFTER and streak >= HALT_AFTER and not already_halted:
+            ctl_set(self.conn, "halted", "1")
+            self.event(f"{streak} failures with no success — dispatch HALTED")
+            notify(
+                "qsched: dispatch halted",
+                f"{streak} consecutive job failures (no successful job in between); "
+                f"dispatch stopped until `q fixed <id> [...]` or `q resume`.\n"
+                f"Latest: job {job_id} (exit {exit_code}), {outcome}.\n"
+                f"log: {log_path}\n\n--- log tail ---\n{log_tail(log_path)}",
+            )
+            return
+        if already_halted:
             return
         pause_until = float(ctl_get(self.conn, "pause_until", "0"))
-        if now < pause_until:
-            window_failures = int(ctl_get(self.conn, "window_failures", "0")) + 1
-            ctl_set(self.conn, "window_failures", str(window_failures))
-            if window_failures >= HALT_AFTER:
-                ctl_set(self.conn, "halted", "1")
-                self.event(
-                    f"{window_failures} failures in one window — dispatch HALTED"
-                )
-                notify(
-                    "qsched: dispatch halted",
-                    f"{window_failures} job failures within one pause window; "
-                    f"dispatch stopped until `q fixed <id> [...]` or `q resume`.\n"
-                    f"Latest: job {job_id} (exit {exit_code}), {outcome}.",
-                )
+        if now < pause_until:  # pauses do not stack
             return
         ctl_set(self.conn, "pause_until", str(now + PAUSE_SECONDS))
-        ctl_set(self.conn, "window_failures", "1")
         row = self.conn.execute(
             "SELECT argv FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
@@ -509,10 +539,56 @@ class Scheduler:
             f"cmd: {shlex.join(argv)}\nlog: {log_path}\n"
             f"Default applied: {outcome}. "
             f"Dispatch paused {PAUSE_SECONDS / 60:.0f} min.\n"
-            f"  `q fixed {job_id}` -> retry at FRONT instead\n"
-            f"  `q extend [min]`   -> more time before dispatch resumes\n\n"
-            f"--- log tail ---\n{log_tail(log_path)}",
+            + (
+                f"Failure streak: {streak}/{HALT_AFTER} until halt.\n"
+                if HALT_AFTER
+                else ""
+            )
+            + (
+                f"  `q fixed {job_id}` -> retry at FRONT instead\n"
+                f"  `q extend [min]`   -> more time before dispatch resumes\n\n"
+                f"--- log tail ---\n{log_tail(log_path)}"
+            ),
         )
+
+    def check_drain(self, now: float) -> None:
+        """Notify once when the last job of a batch finishes and nothing is left."""
+        if self.running or self.batch_started_at is None:
+            return
+        pending = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM jobs WHERE state IN "
+            f"({','.join('?' * len(ACTIVE_STATES))})",
+            ACTIVE_STATES,
+        ).fetchone()["n"]
+        if pending:
+            return
+        since, self.batch_started_at = self.batch_started_at, None
+        tally = {
+            str(row["state"]): int(row["n"])
+            for row in self.conn.execute(
+                "SELECT state, COUNT(*) AS n FROM jobs WHERE finished_at >= ? "
+                "GROUP BY state",
+                (since,),
+            )
+        }
+        failed_ids = [
+            int(row["id"])
+            for row in self.conn.execute(
+                "SELECT id FROM jobs WHERE state='failed' AND finished_at >= ? "
+                "ORDER BY id",
+                (since,),
+            )
+        ]
+        summary = ", ".join(
+            f"{tally[state]} {state}" for state in TERMINAL_STATES if state in tally
+        )
+        summary = summary or "no jobs finished"
+        self.event(f"queue drained — {summary}")
+        body = f"Ran {_format_age(now - since)}. {summary}.\n"
+        if failed_ids:
+            ids = ", ".join(str(i) for i in failed_ids)
+            body += f"failed ids: {ids}\n  `q fixed <id>` / `q requeue-failed`\n"
+        notify(f"qsched: queue drained — {summary}", body)
 
     def reap(self) -> None:
         for job_id, rj in list(self.running.items()):
@@ -580,13 +656,14 @@ class Scheduler:
     # -- main loop --------------------------------------------------------------
     def loop(self) -> None:
         self.cleanup_stale()
-        self.event(f"scheduler up — gpus {self.gpus}, db {DB_PATH}")
+        self.event(f"scheduler up — gpus {self.gpus}, db {db_path()}")
         try:
             while not self.stop_requested:
                 now = time.time()
                 self.reap()
                 self.process_termination_requests(now)
                 self.dispatch(now)
+                self.check_drain(now)
                 slept = 0.0
                 while slept < POLL_SECONDS and not self.stop_requested:
                     time.sleep(0.25)
@@ -614,8 +691,8 @@ def _pid_matches(pid: int, argv: list[str]) -> bool:
 
 
 def cmd_run(gpus: list[int]) -> None:
-    QSCHED_HOME.mkdir(parents=True, exist_ok=True)
-    lock_file = open(QSCHED_HOME / "scheduler.lock", "w")
+    qsched_home().mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path(), "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -641,6 +718,36 @@ def _format_age(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
+TQDM_RE = re.compile(
+    r"(?P<pct>\d{1,3})%\|[^|]*\|\s*\d+/\d+\s*"
+    r"\[(?P<elapsed>[\d:]+)<(?P<remaining>[\d:]+|\?)"
+)
+
+
+def _parse_hms(value: str) -> float:
+    """'58:20' -> 3500.0, '3:13:17' -> 11597.0."""
+    seconds = 0.0
+    for part in value.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds
+
+
+def tqdm_progress(path: Path, max_bytes: int = 4096) -> tuple[int, float] | None:
+    """(percent, seconds remaining) from the last complete tqdm bar in the tail."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - max_bytes))
+            tail = handle.read().decode(errors="replace")
+    except OSError:
+        return None
+    for chunk in reversed(re.split(r"[\r\n]", tail)):
+        match = TQDM_RE.search(chunk)
+        if match and match["remaining"] != "?":
+            return int(match["pct"]), _parse_hms(match["remaining"])
+    return None
+
+
 def cmd_status(show_all: bool) -> None:
     conn = db()
     now = time.time()
@@ -653,6 +760,15 @@ def cmd_status(show_all: bool) -> None:
             f"!! dispatch paused {pause_until - now:.0f}s more — "
             f"`q fixed <id>` / `q extend [min]` / `q resume`"
         )
+    tally = {
+        str(row["state"]): int(row["n"])
+        for row in conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    }
+    if tally:
+        summary = " · ".join(
+            f"{state} {tally[state]}" for state in STATE_ORDER if state in tally
+        )
+        print(f"{summary}  ({sum(tally.values())} total)")
     rows = conn.execute("SELECT * FROM jobs ORDER BY rank, id").fetchall()
     if not show_all:
         finished = [r for r in rows if r["state"] not in ACTIVE_STATES]
@@ -660,32 +776,53 @@ def cmd_status(show_all: bool) -> None:
     if not rows:
         print("queue is empty")
         return
-    print(f"{'ID':>5} {'STATE':<9} {'GPU':>3} {'TRY':>3} {'TIME':>6}  COMMAND")
+    print(
+        f"{'ID':>5} {'STATE':<9} {'GPU':>3} {'TRY':>3} {'TIME':>6} {'ETA':>10}  COMMAND"
+    )
     for row in rows:
-        if row["started_at"] and row["state"] in ("running", "canceling"):
+        live = row["state"] in ("running", "canceling")
+        if row["started_at"] and live:
             runtime = _format_age(now - row["started_at"])
         elif row["started_at"] and row["finished_at"]:
             runtime = _format_age(row["finished_at"] - row["started_at"])
         else:
             runtime = "-"
+        eta = "-"
+        if live and row["log_path"]:
+            progress = tqdm_progress(Path(row["log_path"]))
+            if progress is not None:
+                percent, remaining = progress
+                eta = f"{percent}% {_format_age(remaining)}"
         argv: list[str] = json.loads(row["argv"])
         command = shlex.join(argv)
-        command = command if len(command) <= 90 else command[:87] + "..."
+        command = command if len(command) <= 80 else command[:77] + "..."
         gpu = row["gpu"] if row["gpu"] is not None else "-"
         print(
             f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} "
-            f"{runtime:>6}  {command}"
+            f"{runtime:>6} {eta:>10}  {command}"
         )
 
 
-def cmd_show(job_id: int) -> None:
+def cmd_show(job_id: int, resubmit: bool) -> None:
     conn = db()
-    row = conn.execute("SELECT argv FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    row = conn.execute(
+        "SELECT argv, env, cwd FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
     if row is None:
         print(f"no such job: {job_id}", file=sys.stderr)
         raise SystemExit(1)
     argv: list[str] = json.loads(row["argv"])
-    print(shlex.join(argv))
+    env: dict[str, str] = json.loads(row["env"])
+    if resubmit:
+        flags = [f"--env {shlex.quote(f'{k}={v}')}" for k, v in env.items()]
+        line = " ".join(["q add", *flags, "--", shlex.join(argv)])
+        cwd = str(row["cwd"])
+        print(line if cwd == os.getcwd() else f"cd {shlex.quote(cwd)} && {line}")
+        return
+    print(f"cwd: {row['cwd']}")
+    for key, value in env.items():
+        print(f"env: {key}={value}")
+    print(f"cmd: {shlex.join(argv)}")
 
 
 def cmd_logs(job_id: int, follow: bool) -> None:
@@ -741,9 +878,15 @@ def cmd_cancel(job_ids: list[int]) -> None:
     conn.commit()
 
 
-def cmd_restart(job_ids: list[int]) -> None:
+def cmd_restart(job_ids: list[int], restart_all: bool) -> None:
     conn = db()
+    if job_ids and restart_all:
+        raise SystemExit("`q restart --all` takes no job ids")
     if not job_ids:
+        if not restart_all:
+            raise SystemExit(
+                "no job ids given — use `q restart --all` to restart every running job"
+            )
         rows = conn.execute(
             "SELECT id FROM jobs WHERE state='running' ORDER BY id"
         ).fetchall()
@@ -772,7 +915,7 @@ def cmd_restart(job_ids: list[int]) -> None:
 
 def cmd_fixed(job_ids: list[int]) -> None:
     conn = db()
-    for job_id in job_ids:  # first listed gets the lowest rank -> runs first
+    for job_id in reversed(job_ids):  # first listed ends up first in the queue
         row = conn.execute(
             "SELECT state, retries FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
@@ -796,12 +939,29 @@ def cmd_fixed(job_ids: list[int]) -> None:
     print("dispatch resumed")
 
 
+def cmd_reorder(job_ids: list[int], to_front: bool) -> None:
+    conn = db()
+    ordered = reversed(job_ids) if to_front else iter(job_ids)
+    for job_id in ordered:  # listed order is preserved in the queue
+        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            print(f"job {job_id}: not found")
+        elif row["state"] != "queued":
+            print(f"job {job_id}: state {row['state']}, only queued jobs can be moved")
+        else:
+            rank = front_rank(conn) if to_front else back_rank(conn)
+            conn.execute("UPDATE jobs SET rank=? WHERE id=?", (rank, job_id))
+            print(f"job {job_id}: moved to {'front' if to_front else 'back'}")
+    conn.commit()
+
+
 def cmd_extend(minutes: float) -> None:
     conn = db()
     now = time.time()
     base = max(now, float(ctl_get(conn, "pause_until", "0")))
     ctl_set(conn, "pause_until", str(base + minutes * 60))
     ctl_set(conn, "halted", "0")  # a halt becomes a timed pause
+    ctl_set(conn, "fail_streak", "0")  # ... and the breaker gets a fresh count
     time_tuple = time.localtime(base + minutes * 60)
     print(f"pause extended until {time.strftime('%H:%M:%S', time_tuple)}")
 
@@ -825,6 +985,65 @@ def cmd_requeue_failed() -> None:
         )
     conn.commit()
     print(f"requeued {len(rows)} failed job(s) at back")
+
+
+def _scheduler_running() -> bool:
+    path = lock_path()
+    if not path.exists():
+        return False
+    try:
+        with path.open("r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def prune_orphan_logs(conn: sqlite3.Connection) -> int:
+    """Delete every logs/<id>.log with no matching row — logs follow the db."""
+    logs = log_dir()
+    if not logs.is_dir():
+        return 0
+    live = {int(row["id"]) for row in conn.execute("SELECT id FROM jobs")}
+    removed = 0
+    for path in logs.glob("*.log"):
+        if path.stem.isdigit() and int(path.stem) not in live:
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
+def cmd_clear(wipe_all: bool, older_than_days: float | None, dry_run: bool) -> None:
+    conn = db()
+    if wipe_all:
+        if _scheduler_running():
+            raise SystemExit("a scheduler is running — stop it before `q clear --all`")
+        rows = conn.execute("SELECT id FROM jobs ORDER BY id").fetchall()
+    else:
+        cutoff = time.time() - (older_than_days or 0.0) * 86400
+        rows = conn.execute(
+            f"SELECT id FROM jobs WHERE state IN "
+            f"({','.join('?' * len(TERMINAL_STATES))}) "
+            f"AND COALESCE(finished_at, 0) <= ? ORDER BY id",
+            (*TERMINAL_STATES, cutoff),
+        ).fetchall()
+    ids = [int(row["id"]) for row in rows]
+    if dry_run:
+        listed = ", ".join(str(i) for i in ids[:20]) + ("..." if len(ids) > 20 else "")
+        print(f"-- dry run: would delete {len(ids)} job(s) and their logs: {listed}")
+        return
+    conn.executemany("DELETE FROM jobs WHERE id=?", [(i,) for i in ids])
+    if wipe_all:
+        conn.execute("DELETE FROM control")
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='jobs'")
+        except sqlite3.OperationalError:  # no autoincrement row yet
+            pass
+    conn.commit()
+    print(f"deleted {len(ids)} job(s), {prune_orphan_logs(conn)} log file(s)")
 
 
 # ------------------------------------------------------------------------- main
@@ -864,8 +1083,11 @@ def main(argv: list[str] | None = None) -> None:
     p_logs.add_argument("job_id", type=int)
     p_logs.add_argument("-f", "--follow", action="store_true")
 
-    p_logs = sub.add_parser("show", help="print a job's command")
-    p_logs.add_argument("job_id", type=int)
+    p_show = sub.add_parser("show", help="print a job's command, env and cwd")
+    p_show.add_argument("job_id", type=int)
+    p_show.add_argument(
+        "-r", "--resubmit", action="store_true", help="print a paste-able q add line"
+    )
 
     p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
     p_cancel.add_argument("job_ids", type=int, nargs="+")
@@ -873,9 +1095,25 @@ def main(argv: list[str] | None = None) -> None:
     p_restart = sub.add_parser(
         "restart", help="terminate running jobs and requeue in place"
     )
+    p_restart.add_argument("job_ids", type=int, nargs="*")
     p_restart.add_argument(
-        "job_ids", type=int, nargs="*", help="default: all running jobs"
+        "--all", action="store_true", help="restart every running job"
     )
+
+    p_front = sub.add_parser("front", help="move queued jobs to the front")
+    p_front.add_argument("job_ids", type=int, nargs="+")
+
+    p_back = sub.add_parser("back", help="move queued jobs to the back")
+    p_back.add_argument("job_ids", type=int, nargs="+")
+
+    p_clear = sub.add_parser("clear", help="delete finished jobs and their logs")
+    p_clear.add_argument(
+        "--all", action="store_true", help="wipe the queue (scheduler must be down)"
+    )
+    p_clear.add_argument(
+        "--older-than", type=float, metavar="DAYS", help="only jobs finished before"
+    )
+    p_clear.add_argument("-n", "--dry-run", action="store_true")
 
     p_fixed = sub.add_parser(
         "fixed", help="mark failure fixed: retry at front of queue"
@@ -899,13 +1137,19 @@ def main(argv: list[str] | None = None) -> None:
         case "status":
             cmd_status(ns.all)
         case "show":
-            cmd_show(ns.job_id)
+            cmd_show(ns.job_id, ns.resubmit)
         case "logs":
             cmd_logs(ns.job_id, ns.follow)
         case "cancel":
             cmd_cancel(ns.job_ids)
         case "restart":
-            cmd_restart(ns.job_ids)
+            cmd_restart(ns.job_ids, ns.all)
+        case "front":
+            cmd_reorder(ns.job_ids, to_front=True)
+        case "back":
+            cmd_reorder(ns.job_ids, to_front=False)
+        case "clear":
+            cmd_clear(ns.all, ns.older_than, ns.dry_run)
         case "fixed":
             cmd_fixed(ns.job_ids)
         case "extend":
