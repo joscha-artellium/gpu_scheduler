@@ -362,6 +362,19 @@ def log_tail(path: Path, max_bytes: int = 800) -> str:
 # --------------------------------------------------------------------- scheduler
 
 
+def base_env() -> dict[str, str]:
+    """Drop uv's script-env markers so jobs resolve their own project venv."""
+    env = dict(os.environ)
+    script_env = env.pop("VIRTUAL_ENV", None)
+    env.pop("UV_RUN_RECURSION_DEPTH", None)
+    if script_env and "PATH" in env:
+        bin_dir = str(Path(script_env) / "bin")
+        env["PATH"] = os.pathsep.join(
+            p for p in env["PATH"].split(os.pathsep) if p != bin_dir
+        )
+    return env
+
+
 @dataclass
 class RunningJob:
     job_id: int
@@ -418,7 +431,7 @@ class Scheduler:
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / f"{job_id}.log"
         log_file: IO[bytes] = open(log_path, "ab", buffering=0)
-        env = {**os.environ, **job_env, "CUDA_VISIBLE_DEVICES": str(gpu)}
+        env = {**base_env(), **job_env, "CUDA_VISIBLE_DEVICES": str(gpu)}
         header = f"== qsched job {job_id} on gpu {gpu} :: {shlex.join(argv)}\n"
         log_file.write(header.encode())
         try:
@@ -748,6 +761,24 @@ def tqdm_progress(path: Path, max_bytes: int = 4096) -> tuple[int, float] | None
     return None
 
 
+STATUS_CMD_WIDTH = 76
+STATUS_CMD_HEAD = 13  # keeps "uv run python" before the elision
+STATUS_ENV_MAX = 24
+
+
+def _elide(text: str, width: int, head: int) -> str:
+    """Keep `head` leading chars plus as much of the tail as fits in `width`."""
+    if len(text) <= width:
+        return text
+    tail = width - head - 3
+    return f"{text[:head]}...{text[-tail:]}" if tail > 0 else text[:width]
+
+
+def _render_env(raw: str) -> str:
+    env: dict[str, str] = json.loads(raw)
+    return ",".join(f"{k}={v}" for k, v in env.items()) if env else "-"
+
+
 def cmd_status(show_all: bool) -> None:
     conn = db()
     now = time.time()
@@ -776,8 +807,11 @@ def cmd_status(show_all: bool) -> None:
     if not rows:
         print("queue is empty")
         return
+    envs = {int(row["id"]): _render_env(row["env"]) for row in rows}
+    env_width = min(max(3, *map(len, envs.values())), STATUS_ENV_MAX)
     print(
-        f"{'ID':>5} {'STATE':<9} {'GPU':>3} {'TRY':>3} {'TIME':>6} {'ETA':>10}  COMMAND"
+        f"{'ID':>5} {'STATE':<9} {'TRY':>3} {'TIME':>6} {'ETA':>10} {'GPU':>3}  "
+        f"{'ENV':<{env_width}}  COMMAND"
     )
     for row in rows:
         live = row["state"] in ("running", "canceling")
@@ -794,12 +828,12 @@ def cmd_status(show_all: bool) -> None:
                 percent, remaining = progress
                 eta = f"{percent}% {_format_age(remaining)}"
         argv: list[str] = json.loads(row["argv"])
-        command = shlex.join(argv)
-        command = command if len(command) <= 80 else command[:77] + "..."
+        command = _elide(shlex.join(argv), STATUS_CMD_WIDTH, STATUS_CMD_HEAD)
+        env = _elide(envs[int(row["id"])], env_width, env_width // 2)
         gpu = row["gpu"] if row["gpu"] is not None else "-"
         print(
-            f"{row['id']:>5} {row['state']:<9} {gpu!s:>3} {row['retries']:>3} "
-            f"{runtime:>6} {eta:>10}  {command}"
+            f"{row['id']:>5} {row['state']:<9} {row['retries']:>3} "
+            f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env:<{env_width}}  {command}"
         )
 
 
