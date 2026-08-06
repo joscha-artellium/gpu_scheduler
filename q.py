@@ -70,7 +70,8 @@ QSCHED_PAUSE_SECONDS (default 300) — running jobs continue. During (or after)
 the pause you can override the default:
 
   1. `q fixed <id> [...]` — you fixed it: the job moves to the FRONT of the
-     queue, regardless of retry/failure count (the count is NOT reset — a
+     queue (ahead of everything queued, behind whatever is already running),
+     regardless of retry/failure count (the count is NOT reset — a
      fixed job that fails unattended again follows the default for its
      count). Also clears any pause/halt.
   2. `q extend [minutes]` — buy more time before dispatch resumes.
@@ -140,6 +141,7 @@ def notify_hook() -> Path:
 
 
 ACTIVE_STATES = ("queued", "running", "canceling", "restarting")
+DISPATCHED_STATES = ("running", "canceling", "restarting")  # active, holding a GPU
 TERMINAL_STATES = ("done", "failed", "canceled")
 STATE_ORDER = (*ACTIVE_STATES, *TERMINAL_STATES)
 
@@ -178,9 +180,23 @@ def db() -> sqlite3.Connection:
     return conn
 
 
-def front_rank(conn: sqlite3.Connection) -> float:
-    row = conn.execute("SELECT COALESCE(MIN(rank), 0) - 1 AS r FROM jobs").fetchone()
-    return float(row["r"])
+def queue_front_ranks(conn: sqlite3.Connection, count: int) -> list[float]:
+    """`count` ascending ranks ahead of every queued job, behind every running one.
+
+    Degenerate case: if a queued job already outranks a running one (possible
+    from an earlier move) the band is unsatisfiable and queue position wins —
+    the ranks land below the queue head and may precede a running job.
+    """
+    row = conn.execute(
+        f"SELECT MIN(CASE WHEN state='queued' THEN rank END) AS head, "
+        f"MAX(CASE WHEN state IN ({','.join('?' * len(DISPATCHED_STATES))}) "
+        f"THEN rank END) AS tail FROM jobs",
+        DISPATCHED_STATES,
+    ).fetchone()
+    head = back_rank(conn) if row["head"] is None else float(row["head"])
+    tail = None if row["tail"] is None else float(row["tail"])
+    lo = max(tail, head - 1.0) if tail is not None and tail < head else head - 1.0
+    return [lo + (head - lo) * (i + 1) / (count + 1) for i in range(count)]
 
 
 def back_rank(conn: sqlite3.Connection) -> float:
@@ -949,25 +965,25 @@ def cmd_restart(job_ids: list[int], restart_all: bool) -> None:
 
 def cmd_fixed(job_ids: list[int]) -> None:
     conn = db()
-    for job_id in reversed(job_ids):  # first listed ends up first in the queue
+    fixable: list[tuple[int, int]] = []
+    for job_id in job_ids:
         row = conn.execute(
             "SELECT state, retries FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
         if row is None:
             print(f"job {job_id}: not found")
-            continue
-        if row["state"] not in ("queued", "failed"):
+        elif row["state"] not in ("queued", "failed"):
             print(f"job {job_id}: state {row['state']}, cannot retry")
-            continue
+        else:
+            fixable.append((job_id, int(row["retries"])))
+    ranks = queue_front_ranks(conn, len(fixable))  # listed order = queue order
+    for (job_id, retries), rank in zip(fixable, ranks, strict=True):
         conn.execute(
             "UPDATE jobs SET state='queued', rank=?, gpu=NULL, pid=NULL, "
             "started_at=NULL, finished_at=NULL, exit_code=NULL WHERE id=?",
-            (front_rank(conn), job_id),
+            (rank, job_id),
         )
-        print(
-            f"job {job_id}: requeued at front "
-            f"(unattended retries used: {row['retries']})"
-        )
+        print(f"job {job_id}: requeued at front (unattended retries used: {retries})")
     conn.commit()
     clear_pause(conn)
     print("dispatch resumed")
@@ -975,17 +991,23 @@ def cmd_fixed(job_ids: list[int]) -> None:
 
 def cmd_reorder(job_ids: list[int], to_front: bool) -> None:
     conn = db()
-    ordered = reversed(job_ids) if to_front else iter(job_ids)
-    for job_id in ordered:  # listed order is preserved in the queue
+    movable: list[int] = []
+    for job_id in job_ids:
         row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             print(f"job {job_id}: not found")
         elif row["state"] != "queued":
             print(f"job {job_id}: state {row['state']}, only queued jobs can be moved")
         else:
-            rank = front_rank(conn) if to_front else back_rank(conn)
-            conn.execute("UPDATE jobs SET rank=? WHERE id=?", (rank, job_id))
-            print(f"job {job_id}: moved to {'front' if to_front else 'back'}")
+            movable.append(job_id)
+    ranks = (  # listed order is preserved in the queue
+        queue_front_ranks(conn, len(movable))
+        if to_front
+        else [back_rank(conn) + offset for offset in range(len(movable))]
+    )
+    for job_id, rank in zip(movable, ranks, strict=True):
+        conn.execute("UPDATE jobs SET rank=? WHERE id=?", (rank, job_id))
+        print(f"job {job_id}: moved to {'front' if to_front else 'back'}")
     conn.commit()
 
 
