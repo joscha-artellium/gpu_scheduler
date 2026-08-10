@@ -6,6 +6,7 @@
 """Unit tests for qsched. Run: ./test_q.py  (or via pytest)"""
 
 import fcntl
+import shlex
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -18,21 +19,33 @@ from q import (
     Scheduler,
     _parse_hms,
     expand_sweep,
+    run_probe,
+    run_probes,
     split_top_level,
     tqdm_progress,
+    validated_combos,
 )
+
+SENTINEL_CMD = f"echo {q.VALIDATE_SENTINEL}"
 
 
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("QSCHED_HOME", str(tmp_path))
     monkeypatch.setenv("QSCHED_NOTIFY", str(tmp_path / "absent.sh"))
-    monkeypatch.setattr(q, "notify", lambda title, body: NOTIFICATIONS.append(title))
+
+    def record(title: str, body: str, urgency: str = "normal") -> None:
+        NOTIFICATIONS.append(title)
+        URGENCIES.append(urgency)
+
+    monkeypatch.setattr(q, "notify", record)
     NOTIFICATIONS.clear()
+    URGENCIES.clear()
     yield tmp_path
 
 
 NOTIFICATIONS: list[str] = []
+URGENCIES: list[str] = []
 
 
 def enqueue(conn: sqlite3.Connection, *argv: str) -> int:
@@ -452,6 +465,242 @@ def test_show_reports_env_and_cwd(
         capsys.readouterr().out.strip()
         == "q add --env REGION=US3 -- python train.py model=a"
     )
+
+
+# -------------------------------------------------- pause / halt override commands
+
+
+def test_failure_notification_is_throttled_by_the_pause(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(q, "PAUSE_SECONDS", 60.0)
+    monkeypatch.setattr(q, "HALT_AFTER", 0)
+    sched = scheduler()
+    for _ in range(3):  # three failures, one open pause window
+        job = enqueue(sched.conn, "false")
+        sched.finalize(job, 1, home / "logs" / f"{job}.log")
+    assert len(NOTIFICATIONS) == 1
+
+
+def test_only_the_halt_is_critical(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(q, "HALT_AFTER", 2)
+    monkeypatch.setattr(q, "PAUSE_SECONDS", 0.0)
+    sched = scheduler()
+    for _ in range(2):
+        job = enqueue(sched.conn, "false")
+        sched.finalize(job, 1, home / "logs" / f"{job}.log")
+    assert URGENCIES == ["normal", "critical"]
+
+
+def test_resume_clears_pause_halt_and_streak(home: Path) -> None:
+    conn = q.db()
+    q.ctl_set(conn, "halted", "1")
+    q.ctl_set(conn, "pause_until", str(time.time() + 600))
+    q.ctl_set(conn, "fail_streak", "7")
+    q.cmd_resume()
+    conn = q.db()
+    assert q.ctl_get(conn, "halted", "0") == "0"
+    assert float(q.ctl_get(conn, "pause_until", "0")) == 0.0
+    assert q.ctl_get(conn, "fail_streak", "0") == "0"
+
+
+def test_resume_revives_no_jobs(home: Path) -> None:
+    conn = q.db()
+    failed = enqueue(conn, "false")
+    conn.execute("UPDATE jobs SET state='failed', retries=1 WHERE id=?", (failed,))
+    conn.commit()
+    q.cmd_resume()
+    assert state_of(q.db(), failed) == "failed"
+
+
+def test_fixed_clears_a_halt(home: Path) -> None:
+    conn = q.db()
+    job = enqueue(conn, "false")
+    conn.execute("UPDATE jobs SET state='failed' WHERE id=?", (job,))
+    conn.commit()
+    q.ctl_set(conn, "halted", "1")
+    q.cmd_fixed([job])
+    assert q.ctl_get(q.db(), "halted", "0") == "0"
+
+
+def test_requeue_failed_resets_retries_and_goes_to_the_back(home: Path) -> None:
+    conn = q.db()
+    failed, queued = enqueue(conn, "false"), enqueue(conn, "true")
+    conn.execute(
+        "UPDATE jobs SET state='failed', retries=1, exit_code=1, finished_at=? "
+        "WHERE id=?",
+        (time.time(), failed),
+    )
+    conn.commit()
+    q.cmd_requeue_failed()
+    row = q.db().execute("SELECT * FROM jobs WHERE id=?", (failed,)).fetchone()
+    assert (row["state"], row["retries"], row["exit_code"]) == ("queued", 0, None)
+    order = [
+        int(r["id"]) for r in q.db().execute("SELECT id FROM jobs ORDER BY rank, id")
+    ]
+    assert order == [queued, failed]
+
+
+def test_requeue_failed_spares_canceled_and_keeps_a_halt(home: Path) -> None:
+    conn = q.db()
+    canceled = enqueue(conn, "true")
+    conn.execute("UPDATE jobs SET state='canceled' WHERE id=?", (canceled,))
+    conn.commit()
+    q.ctl_set(conn, "halted", "1")
+    q.cmd_requeue_failed()
+    assert state_of(q.db(), canceled) == "canceled"
+    assert q.ctl_get(q.db(), "halted", "0") == "1"  # requeueing is not looking
+
+
+def test_front_ranks_degenerate_when_queued_outranks_running(home: Path) -> None:
+    conn = q.db()
+    running, queued = enqueue(conn, "true"), enqueue(conn, "true")
+    conn.execute("UPDATE jobs SET state='running', rank=9 WHERE id=?", (running,))
+    conn.execute("UPDATE jobs SET rank=1 WHERE id=?", (queued,))
+    conn.commit()
+    ranks = q.queue_front_ranks(conn, 1)
+    assert ranks[0] < 1.0  # queue position wins; may precede the running job
+
+
+# ------------------------------------------------------------------- submission
+
+
+def test_parse_env_pairs_rejects_malformed(home: Path) -> None:
+    assert q.parse_env_pairs(["A=1", "B="]) == {"A": "1", "B": ""}
+    with pytest.raises(SystemExit):
+        q.parse_env_pairs(["NOEQUALS"])
+    with pytest.raises(SystemExit):
+        q.parse_env_pairs(["=novalue"])
+
+
+def test_sweep_dry_run_lines_round_trip(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = ["python", "t.py", 'grouping=["Day","key"],["Day"]', "lr=0.1,0.01"]
+    q.cmd_sweep([], command, dry_run=True)
+    lines = capsys.readouterr().out.splitlines()
+    assert [shlex.split(line) for line in lines] == expand_sweep(command)
+    assert q.db().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+def test_base_env_drops_uv_script_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIRTUAL_ENV", "/tmp/script-venv")
+    monkeypatch.setenv("UV_RUN_RECURSION_DEPTH", "1")
+    monkeypatch.setenv("PATH", "/tmp/script-venv/bin:/usr/bin")
+    env = q.base_env()
+    assert "VIRTUAL_ENV" not in env and "UV_RUN_RECURSION_DEPTH" not in env
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_spawn_failure_is_a_normal_failure(home: Path) -> None:
+    sched = scheduler()
+    job = q.insert_job(sched.conn, ["definitely-not-a-real-binary"], {})
+    sched.dispatch(time.time())
+    row = sched.conn.execute("SELECT * FROM jobs WHERE id=?", (job,)).fetchone()
+    assert (row["state"], row["retries"], row["exit_code"]) == ("queued", 1, 127)
+    assert "spawn failed" in (home / "logs" / f"{job}.log").read_text()
+
+
+def test_cancel_running_defers_to_the_scheduler(home: Path) -> None:
+    conn = q.db()
+    job = enqueue(conn, "true")
+    conn.execute("UPDATE jobs SET state='running' WHERE id=?", (job,))
+    conn.commit()
+    q.cmd_cancel([job])
+    assert state_of(q.db(), job) == "canceling"
+
+
+# ------------------------------------------------------------ validation probes
+
+
+def test_probe_passes_only_with_the_sentinel(home: Path) -> None:
+    good = run_probe(["sh", "-c", SENTINEL_CMD], {}, str(home))
+    assert (good.status, good.ok) == ("pass", True)
+    quiet = run_probe(["sh", "-c", "echo nothing to say"], {}, str(home))
+    assert quiet.status == "unsupported"  # never silently a pass
+    assert "nothing to say" in quiet.output
+
+
+def test_probe_reports_nonzero_exit_with_output(home: Path) -> None:
+    result = run_probe(["sh", "-c", "echo bad config >&2; exit 3"], {}, str(home))
+    assert (result.status, result.reason) == ("failed", "exit 3")
+    assert "bad config" in result.output
+
+
+def test_probe_times_out(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(q, "VALIDATE_TIMEOUT", 0.3)
+    result = run_probe(["sh", "-c", f"{SENTINEL_CMD}; sleep 30"], {}, str(home))
+    assert result.status == "timeout"
+
+
+def test_probe_spawn_error(home: Path) -> None:
+    assert run_probe(["definitely-not-a-real-binary"], {}, str(home)).status == "error"
+
+
+def test_probe_env_hides_gpus_and_carries_job_env(home: Path) -> None:
+    argv = [
+        "sh",
+        "-c",
+        f'echo "V=$QSCHED_VALIDATE CUDA=[$CUDA_VISIBLE_DEVICES] R=$REGION P=$PWD"; '
+        f"{SENTINEL_CMD}; exit 1",
+    ]
+    result = run_probe(argv, {"REGION": "US3"}, str(home))
+    assert f"V=1 CUDA=[] R=US3 P={home}" in result.output
+
+
+def test_probes_keep_combo_order_when_parallel(home: Path) -> None:
+    combos = [
+        ["sh", "-c", f"sleep 0.3; {SENTINEL_CMD}"],
+        ["sh", "-c", "exit 1"],
+        ["sh", "-c", SENTINEL_CMD],
+    ]
+    results = run_probes(combos, {}, workers=3)
+    assert [r.status for r in results] == ["pass", "failed", "pass"]
+
+
+def test_validated_combos_all_bad_aborts(home: Path) -> None:
+    with pytest.raises(SystemExit):
+        validated_combos([["false"], ["false"]], {}, workers=2, assume_yes=True)
+
+
+def test_validated_combos_keeps_survivors_with_yes(home: Path) -> None:
+    combos = [["sh", "-c", SENTINEL_CMD], ["false"]]
+    assert validated_combos(combos, {}, workers=2, assume_yes=True) == [combos[0]]
+
+
+def test_validated_combos_declined_enqueues_nothing(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(q, "prompt_yes", lambda question, timeout: False)
+    with pytest.raises(SystemExit):
+        validated_combos(
+            [["sh", "-c", SENTINEL_CMD], ["false"]], {}, workers=2, assume_yes=False
+        )
+
+
+def test_add_with_validate_enqueues_nothing_on_rejection(home: Path) -> None:
+    with pytest.raises(SystemExit):
+        q.cmd_add([], ["false"], validate=True, assume_yes=True)
+    assert q.db().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+def test_sweep_with_validate_enqueues_only_survivors(home: Path) -> None:
+    script = f'test "$1" = "V=ok" && {SENTINEL_CMD}'
+    command = ["sh", "-c", script, "probe", "V=ok,bad"]
+    q.cmd_sweep([], command, dry_run=False, validate=True, assume_yes=True)
+    rows = q.db().execute("SELECT argv FROM jobs").fetchall()
+    assert len(rows) == 1 and "V=ok" in rows[0]["argv"]
+
+
+def test_sweep_dry_run_with_validate_reports_and_exits_nonzero(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        q.cmd_sweep([], ["false"], dry_run=True, validate=True)
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "false"  # stdout stays paste-able
+    assert "0 passed, 1 rejected" in captured.err
+    assert q.db().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
 
 
 if __name__ == "__main__":
