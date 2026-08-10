@@ -60,11 +60,10 @@ VALIDATION PROBES
 With --validate, every job is run once before it is enqueued with
 QSCHED_VALIDATE=1 in its environment (argv is untouched) and no GPUs visible,
 so a cooperating target can validate its config and fail fast. A probe passes
-only if it exits 0 AND prints the sentinel `qsched: validated`; a target that
-ignores the variable is reported as unsupported rather than silently passing.
-Probes run in parallel, each under QSCHED_VALIDATE_TIMEOUT seconds. If some
-fail you are asked whether to enqueue the survivors (default yes after 100 s;
---yes answers up front, for submission scripts).
+only if it exits 0 AND prints the sentinel `qsched: validated`. Probes run in
+parallel, each under QSCHED_VALIDATE_TIMEOUT seconds. When some are rejected,
+--on-reject decides: ask (default, yes after 100 s), skip (enqueue the rest),
+or abort (enqueue nothing).
 
 Environment variables go through --env (repeatable), never shell prefixes:
 
@@ -123,19 +122,51 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from itertools import product
 from pathlib import Path
 from shutil import which
-from typing import IO, Any, Literal
+from typing import IO, Any
 
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
 HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "12"))  # 0 disables halting
 POLL_SECONDS = float(os.environ.get("QSCHED_POLL_SECONDS", "2"))
+
+
+def _status_hours(spec: str) -> list[int]:
+    try:
+        hours = sorted({int(part) for part in spec.split(",") if part.strip()})
+    except ValueError:
+        raise SystemExit(f"QSCHED_STATUS_AT: not a list of hours: {spec!r}") from None
+    if any(not 0 <= hour <= 23 for hour in hours):
+        raise SystemExit(f"QSCHED_STATUS_AT: hours must be 0-23, got {spec!r}")
+    return hours
+
+
+STATUS_HOURS = _status_hours(os.environ.get("QSCHED_STATUS_AT", "7,20"))
+
+
+def next_digest_after(moment: float) -> float:
+    """Next local wall-clock digest hour, or inf when digests are switched off."""
+    if not STATUS_HOURS:
+        return float("inf")
+    start = datetime.fromtimestamp(moment)
+    for offset in (0, 1):
+        day = (start + timedelta(days=offset)).replace(
+            minute=0, second=0, microsecond=0
+        )
+        for hour in STATUS_HOURS:
+            due = day.replace(hour=hour).timestamp()
+            if due > moment:
+                return due
+    return float("inf")
+
+
 CANCEL_GRACE_SECONDS = 10.0
 VALIDATE_TIMEOUT = float(os.environ.get("QSCHED_VALIDATE_TIMEOUT", "60"))
 VALIDATE_SENTINEL = "qsched: validated"
-VALIDATE_PROMPT_SECONDS = 100.0
+VALIDATE_PROMPT_SECONDS = 60.0
 
 
 def qsched_home() -> Path:
@@ -339,19 +370,13 @@ def clear_pause(conn: sqlite3.Connection) -> None:
 
 # ------------------------------------------------------------ validation probes
 
-ProbeStatus = Literal["pass", "failed", "unsupported", "timeout", "error"]
-
 
 @dataclass(frozen=True)
 class ProbeResult:
     argv: list[str]
-    status: ProbeStatus
-    reason: str
+    ok: bool
+    reason: str = ""
     output: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.status == "pass"
 
 
 def _output_tail(text: str, max_lines: int = 40) -> str:
@@ -376,57 +401,42 @@ def run_probe(argv: list[str], env: dict[str, str], cwd: str) -> ProbeResult:
             start_new_session=True,
         )
     except OSError as exc:
-        return ProbeResult(argv, "error", str(exc))
+        return ProbeResult(argv, False, f"could not start: {exc}")
     try:
         raw, _ = proc.communicate(timeout=VALIDATE_TIMEOUT)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc.pid, signal.SIGKILL)
         raw, _ = proc.communicate()
-        return ProbeResult(
-            argv,
-            "timeout",
-            f"no verdict within {VALIDATE_TIMEOUT:.0f}s",
-            _output_tail(raw.decode(errors="replace")),
-        )
+        tail = _output_tail(raw.decode(errors="replace"))
+        return ProbeResult(argv, False, f"no answer in {VALIDATE_TIMEOUT:.0f}s", tail)
     output = raw.decode(errors="replace")
     if proc.returncode != 0:
-        return ProbeResult(
-            argv, "failed", f"exit {proc.returncode}", _output_tail(output)
-        )
+        return ProbeResult(argv, False, f"exit {proc.returncode}", _output_tail(output))
     if VALIDATE_SENTINEL not in output:
-        return ProbeResult(
-            argv,
-            "unsupported",
-            f"exit 0 but never printed {VALIDATE_SENTINEL!r}",
-            _output_tail(output),
-        )
-    return ProbeResult(argv, "pass", "ok")
+        reason = f"exit 0 but never printed {VALIDATE_SENTINEL!r}"
+        return ProbeResult(argv, False, reason, _output_tail(output))
+    return ProbeResult(argv, True)
 
 
-def run_probes(
-    combos: list[list[str]], env: dict[str, str], workers: int = 0
-) -> list[ProbeResult]:
+def run_probes(combos: list[list[str]], env: dict[str, str]) -> list[ProbeResult]:
     """Probe every combo in parallel; results stay in combo order."""
     cwd = os.getcwd()
-    workers = workers if workers > 0 else min(8, os.cpu_count() or 1)
-    if workers == 1 or len(combos) == 1:
+    workers = min(8, os.cpu_count() or 1)
+    if len(combos) == 1 or workers == 1:
         return [run_probe(combo, env, cwd) for combo in combos]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda combo: run_probe(combo, env, cwd), combos))
 
 
 def report_probes(results: list[ProbeResult]) -> None:
-    rejected = [r for r in results if not r.ok]
+    rejected = [result for result in results if not result.ok]
     passed = len(results) - len(rejected)
     print(
         f"-- validated {len(results)} job(s): {passed} passed, {len(rejected)} rejected",
         file=sys.stderr,
     )
     for result in rejected:
-        print(
-            f"\n!! {result.status} ({result.reason}): {shlex.join(result.argv)}",
-            file=sys.stderr,
-        )
+        print(f"\n!! {result.reason}: {shlex.join(result.argv)}", file=sys.stderr)
         if result.output:
             print(f"   --- output tail ---\n{result.output}", file=sys.stderr)
 
@@ -444,17 +454,19 @@ def prompt_yes(question: str, timeout: float) -> bool:
 
 
 def validated_combos(
-    combos: list[list[str]], env: dict[str, str], workers: int, assume_yes: bool
+    combos: list[list[str]], env: dict[str, str], on_reject: str = "ask"
 ) -> list[list[str]]:
     """Probe, report, and return the combos that may be enqueued."""
-    results = run_probes(combos, env, workers)
+    results = run_probes(combos, env)
     if all(result.ok for result in results):
         return combos
     report_probes(results)
     survivors = [result.argv for result in results if result.ok]
     if not survivors:
         raise SystemExit(f"all {len(combos)} job(s) rejected — nothing enqueued")
-    if not assume_yes and not prompt_yes(
+    if on_reject == "abort":
+        raise SystemExit(f"{len(combos) - len(survivors)} rejected — nothing enqueued")
+    if on_reject == "ask" and not prompt_yes(
         f"enqueue the {len(survivors)} job(s) that passed?", VALIDATE_PROMPT_SECONDS
     ):
         raise SystemExit("nothing enqueued")
@@ -468,14 +480,13 @@ def cmd_add(
     env_pairs: list[str],
     command: list[str],
     validate: bool = False,
-    assume_yes: bool = False,
-    workers: int = 0,
+    on_reject: str = "ask",
 ) -> None:
     if not command:
         raise SystemExit("no command given (usage: q add [--env K=V] -- cmd ...)")
     env = parse_env_pairs(env_pairs)
     if validate:
-        validated_combos([command], env, workers, assume_yes)
+        validated_combos([command], env, on_reject)
     conn = db()
     job_id = insert_job(conn, command, env)
     print(f"enqueued job {job_id}: {shlex.join(command)}")
@@ -486,8 +497,7 @@ def cmd_sweep(
     command: list[str],
     dry_run: bool,
     validate: bool = False,
-    assume_yes: bool = False,
-    workers: int = 0,
+    on_reject: str = "ask",
 ) -> None:
     if not command:
         raise SystemExit(
@@ -503,14 +513,14 @@ def cmd_sweep(
                 f"-- dry run: {len(combos)} job(s), nothing enqueued", file=sys.stderr
             )
             return
-        results = run_probes(combos, env, workers)
+        results = run_probes(combos, env)
         report_probes(results)
         print("-- dry run: nothing enqueued", file=sys.stderr)
         if any(not result.ok for result in results):
             raise SystemExit(1)
         return
     if validate:
-        combos = validated_combos(combos, env, workers, assume_yes)
+        combos = validated_combos(combos, env, on_reject)
     conn = db()
     ids = [insert_job(conn, combo, env) for combo in combos]
     print(f"enqueued {len(ids)} job(s): ids {ids[0]}..{ids[-1]}")
@@ -519,14 +529,16 @@ def cmd_sweep(
 # ------------------------------------------------------------------ notifications
 
 
-def notify(title: str, body: str, urgency: str = "normal") -> None:
-    """Only a halt is `critical` — per-failure alerts must self-dismiss."""
+def notify(title: str, body: str, kind: str = "failure") -> None:
+    """kind is one of failure/halt/drain/digest; the hook gets it as argv[3]."""
     try:
         hook = notify_hook()
         if hook.is_file() and os.access(hook, os.X_OK):
-            subprocess.run([str(hook), title, body], timeout=30, check=False)
+            subprocess.run([str(hook), title, body, kind], timeout=30, check=False)
             return
-        if which("notify-send"):
+        # a periodic digest as a desktop popup is noise; email only
+        if kind != "digest" and which("notify-send"):
+            urgency = "critical" if kind == "halt" else "normal"
             subprocess.run(
                 ["notify-send", "-u", urgency, title, body], timeout=10, check=False
             )
@@ -583,6 +595,8 @@ class Scheduler:
     running: dict[int, RunningJob] = field(default_factory=dict)
     stop_requested: bool = False
     batch_started_at: float | None = None  # set on first spawn after a drain
+    last_digest_at: float = field(default_factory=time.time)
+    digest_due: float = field(default_factory=lambda: next_digest_after(time.time()))
 
     # -- helpers ------------------------------------------------------------
     def event(self, message: str) -> None:
@@ -725,7 +739,7 @@ class Scheduler:
                 f"dispatch stopped until `q fixed <id> [...]` or `q resume`.\n"
                 f"Latest: job {job_id} (exit {exit_code}), {outcome}.\n"
                 f"log: {log_path}\n\n--- log tail ---\n{log_tail(log_path)}",
-                urgency="critical",
+                kind="halt",
             )
             return
         if already_halted:
@@ -755,6 +769,25 @@ class Scheduler:
                 f"--- log tail ---\n{log_tail(log_path)}"
             ),
         )
+
+    def maybe_digest(self, now: float) -> None:
+        """Email the standard `q status` view at each QSCHED_STATUS_AT hour."""
+        if now < self.digest_due:
+            return
+        self.digest_due = next_digest_after(now)
+        since, self.last_digest_at = self.last_digest_at, now
+        active = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM jobs WHERE state IN "
+            f"({','.join('?' * len(ACTIVE_STATES))})",
+            ACTIVE_STATES,
+        ).fetchone()["n"]
+        settled = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE finished_at >= ?", (since,)
+        ).fetchone()["n"]
+        if not active and not settled:  # an idle queue stays silent
+            return
+        tally = status_tally(self.conn) or "queue is empty"
+        notify(f"qsched: {tally}", render_status(False, self.conn), kind="digest")
 
     def check_drain(self, now: float) -> None:
         """Notify once when the last job of a batch finishes and nothing is left."""
@@ -793,7 +826,7 @@ class Scheduler:
         if failed_ids:
             ids = ", ".join(str(i) for i in failed_ids)
             body += f"failed ids: {ids}\n  `q fixed <id>` / `q requeue-failed`\n"
-        notify(f"qsched: queue drained — {summary}", body)
+        notify(f"qsched: queue drained — {summary}", body, kind="drain")
 
     def reap(self) -> None:
         for job_id, rj in list(self.running.items()):
@@ -869,6 +902,7 @@ class Scheduler:
                 self.process_termination_requests(now)
                 self.dispatch(now)
                 self.check_drain(now)
+                self.maybe_digest(now)
                 slept = 0.0
                 while slept < POLL_SECONDS and not self.stop_requested:
                     time.sleep(0.25)
@@ -971,37 +1005,34 @@ def _render_env(raw: str) -> str:
     return ",".join(f"{k}={v}" for k, v in env.items()) if env else "-"
 
 
-def cmd_status(show_all: bool) -> None:
-    conn = db()
+def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str:
+    """The `q status` view as text — printed by cmd_status, emailed by digests."""
+    conn = conn if conn is not None else db()
     now = time.time()
+    lines: list[str] = []
     halted = ctl_get(conn, "halted", "0") == "1"
     pause_until = float(ctl_get(conn, "pause_until", "0"))
     if halted:
-        print("!! HALTED (repeated failures) — `q fixed <id> [...]` or `q resume`")
+        lines.append(
+            "!! HALTED (repeated failures) — `q fixed <id> [...]` or `q resume`"
+        )
     elif now < pause_until:
-        print(
+        lines.append(
             f"!! dispatch paused {pause_until - now:.0f}s more — "
             f"`q fixed <id>` / `q extend [min]` / `q resume`"
         )
-    tally = {
-        str(row["state"]): int(row["n"])
-        for row in conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
-    }
-    if tally:
-        summary = " · ".join(
-            f"{state} {tally[state]}" for state in STATE_ORDER if state in tally
-        )
-        print(f"{summary}  ({sum(tally.values())} total)")
+    if summary := status_tally(conn):
+        lines.append(summary)
     rows = conn.execute("SELECT * FROM jobs ORDER BY rank, id").fetchall()
     if not show_all:
         finished = [r for r in rows if r["state"] not in ACTIVE_STATES]
         rows = finished[-5:] + [r for r in rows if r["state"] in ACTIVE_STATES]
     if not rows:
-        print("queue is empty")
-        return
+        lines.append("queue is empty")
+        return "\n".join(lines)
     envs = {int(row["id"]): _render_env(row["env"]) for row in rows}
     env_width = min(max(3, *map(len, envs.values())), STATUS_ENV_MAX)
-    print(
+    lines.append(
         f"{'ID':>5} {'STATE':<9} {'TRY':>3} {'TIME':>6} {'ETA':>10} {'GPU':>3}  "
         f"{'ENV':<{env_width}}  COMMAND"
     )
@@ -1023,10 +1054,29 @@ def cmd_status(show_all: bool) -> None:
         command = _elide(shlex.join(argv), STATUS_CMD_WIDTH, STATUS_CMD_HEAD)
         env = _elide(envs[int(row["id"])], env_width, env_width // 2)
         gpu = row["gpu"] if row["gpu"] is not None else "-"
-        print(
+        lines.append(
             f"{row['id']:>5} {row['state']:<9} {row['retries']:>3} "
             f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env:<{env_width}}  {command}"
         )
+    return "\n".join(lines)
+
+
+def status_tally(conn: sqlite3.Connection) -> str:
+    """`queued 41 · running 3  (44 total)`, or empty when there are no jobs."""
+    tally = {
+        str(row["state"]): int(row["n"])
+        for row in conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    }
+    if not tally:
+        return ""
+    counts = " · ".join(
+        f"{state} {tally[state]}" for state in STATE_ORDER if state in tally
+    )
+    return f"{counts}  ({sum(tally.values())} total)"
+
+
+def cmd_status(show_all: bool) -> None:
+    print(render_status(show_all))
 
 
 def cmd_show(job_id: int, resubmit: bool) -> None:
@@ -1312,18 +1362,11 @@ def main(argv: list[str] | None = None) -> None:
             help="probe each job with QSCHED_VALIDATE=1 before enqueuing",
         )
         p_submit.add_argument(
-            "-j",
-            "--jobs",
-            type=int,
-            default=0,
-            metavar="N",
-            help="parallel validation probes (0 = auto)",
-        )
-        p_submit.add_argument(
-            "-y",
-            "--yes",
-            action="store_true",
-            help="enqueue survivors without prompting when probes fail",
+            "--on-reject",
+            choices=("ask", "skip", "abort"),
+            default="ask",
+            help="when some jobs fail validation: ask (default), "
+            "skip them and enqueue the rest, or abort and enqueue nothing",
         )
 
     p_run = sub.add_parser("run", help="start the scheduler (foreground)")
@@ -1384,9 +1427,9 @@ def main(argv: list[str] | None = None) -> None:
     ns = parser.parse_args(before)
     match ns.cmd:
         case "add":
-            cmd_add(ns.env, command, ns.validate, ns.yes, ns.jobs)
+            cmd_add(ns.env, command, ns.validate, ns.on_reject)
         case "sweep":
-            cmd_sweep(ns.env, command, ns.dry_run, ns.validate, ns.yes, ns.jobs)
+            cmd_sweep(ns.env, command, ns.dry_run, ns.validate, ns.on_reject)
         case "run":
             cmd_run([int(g) for g in str(ns.gpus).split(",") if g != ""])
         case "status":

@@ -92,30 +92,20 @@ had launched from where you typed `q add`.
 
 ## Validation probes (`--validate`)
 
-`q sweep -n` only checks that *q* understood your command line. `--validate`
-additionally asks the **target** whether it understood it, before anything is
-enqueued — so a typo in a config key costs you seconds instead of a queue full
-of jobs that each die on startup.
+`q sweep -n` checks that *q* understood your command line. `--validate` also
+asks the **target** whether it understood it, before anything is enqueued — so
+a typo costs you seconds instead of a queue full of jobs that each die on
+startup.
 
 ```bash
 q sweep --validate -- uv run python scripts/train_predict.py model=xgb01,xgb02
 ```
 
-Each combo is run once, exactly as it will run later (same argv, same recorded
-cwd, same `--env` values, same `VIRTUAL_ENV`-stripped base environment), with
-two additions:
+### What your target has to do
 
-- `QSCHED_VALIDATE=1` — **argv is never modified**, so the target never sees an
-  override its config schema doesn't declare. Your target opts in by reading
-  the variable, validating, and exiting.
-- `CUDA_VISIBLE_DEVICES=""` — a probe can never take VRAM from a job the
-  scheduler is running.
-
-A probe **passes only if it exits 0 *and* prints the sentinel
-`qsched: validated`** on stdout or stderr. Exiting 0 without the sentinel is
-reported as `unsupported`, not as a pass — otherwise every target you hadn't
-updated yet would run its real workload as its own probe and be called valid.
-Minimal cooperating target:
+`q` runs each job once with `QSCHED_VALIDATE=1` in the environment. **Your
+argv is not changed** — no extra flag to declare in your config schema. Read
+the variable, check the config, print `qsched: validated`, exit 0:
 
 ```python
 if os.environ.get("QSCHED_VALIDATE"):
@@ -124,23 +114,36 @@ if os.environ.get("QSCHED_VALIDATE"):
     raise SystemExit(0)
 ```
 
-Mechanics:
+**Both parts are required.** Exit 0 without the sentinel counts as a rejection
+("never printed 'qsched: validated'") — otherwise a target that has never heard
+of `QSCHED_VALIDATE` would run its real workload as its own probe and be
+declared valid.
 
-- Probes run in parallel (`-j N`, default `min(8, cpu_count)`; `-j 1` for
-  serial), each under `QSCHED_VALIDATE_TIMEOUT` seconds (default 60). A
-  timeout is a rejection and the probe's process group is SIGKILLed.
-- Results are reported in **combo order**, not completion order. Rejections go
-  to stderr with the status, the reason, and up to 40 lines of output tail.
-- If some combos fail you are asked whether to enqueue the survivors, and
-  **default to yes after 100 s**. `-y` / `--yes` answers up front — use it in
-  submission scripts, where nobody is watching the prompt.
-- If *every* combo fails, or you answer no, nothing is enqueued and `q` exits
-  1. Otherwise `q` exits 0, so a `set -e` submission script carries on to its
-  next `q sweep`.
-- `q sweep -n --validate` probes and reports but never enqueues and never
-  prompts; it exits 1 if anything was rejected. That is your standalone "is
-  this sweep valid?" command. stdout stays paste-able either way — the
-  verdicts are on stderr.
+Probes get `CUDA_VISIBLE_DEVICES=""` (a probe can never take VRAM from a
+running job), your recorded cwd, and your `--env` values. They run in parallel,
+each capped at `QSCHED_VALIDATE_TIMEOUT` seconds (default 60).
+
+### What happens when something is rejected
+
+Rejections print to stderr with the reason and up to 40 lines of the probe's
+output. What happens next is `--on-reject`:
+
+| flag                  | behaviour                                          |
+|-----------------------|----------------------------------------------------|
+| *(default)* `ask`     | prompt; **yes after 100 s** if you don't answer     |
+| `--on-reject skip`    | enqueue the jobs that passed, no prompt             |
+| `--on-reject abort`   | enqueue nothing, no prompt                          |
+
+Use `skip` in submission scripts, where nobody is watching a prompt. Use
+`abort` when a sweep only makes sense whole.
+
+Exit code is 0 if anything was enqueued, 1 otherwise (all rejected, `abort`, or
+you answered no) — so a `set -e` script stops on `abort` and carries on after
+`skip`.
+
+`q sweep -n --validate` probes and reports but never enqueues and never
+prompts, exiting 1 if anything was rejected. That is your standalone "is this
+sweep valid?" check. stdout stays paste-able either way; verdicts go to stderr.
 
 ## Status
 
@@ -251,7 +254,7 @@ desktops means it never auto-expires); per-failure and drain alerts are
 
 The scheduler runs, in order of preference:
 
-1. `~/.config/qsched/notify.sh <title> <body>` if present+executable
+1. `~/.config/qsched/notify.sh <title> <body> <kind>` if present+executable
    (override path with `QSCHED_NOTIFY`), else
 2. `notify-send` (desktop), **and** `mail -s <title> $QSCHED_EMAIL` if
    `QSCHED_EMAIL` is set and `mail` exists.
@@ -266,8 +269,60 @@ notify-send -u critical "$1" "$2"
 printf '%s\n' "$2" | mail -s "$1" you@example.com
 ```
 
-The hook receives title and body only — urgency is not passed through, so a
-hook picks its own. The body includes the command, log path, and the log tail.
+The hook's third argument is the `kind`: `failure`, `halt`, `drain` or
+`digest`. Older two-argument hooks keep working — shell scripts ignore the
+extra argument. The body includes the command, log path, and the log tail.
+
+## Periodic status digest
+
+The scheduler emails the standard `q status` view — the same table, so it
+carries live ETAs — at fixed local hours. Default `8,14,20`: morning, after
+lunch, and after dinner.
+
+```bash
+QSCHED_STATUS_AT=8,14,20   # default
+QSCHED_STATUS_AT=20        # just the evening one
+QSCHED_STATUS_AT=          # off
+```
+
+- **An idle queue is silent.** A digest is skipped if nothing is active *and*
+  nothing finished since the previous one, so a drained queue doesn't mail you
+  three times a day about nothing.
+- Only `q run` sends digests: no scheduler, no mail.
+- They never reach `notify-send` — a status table as a desktop popup is the
+  opposite of useful. They go to the hook (with `kind=digest`) or to email.
+- Missed hours don't stack: if the scheduler was down at 14:00 it does not
+  send a late one, it just waits for 20:00.
+- The subject is the count line (`qsched: queued 41 · running 3 · done 38
+  (82 total)`), often the whole answer on a phone.
+- Overhead is one float comparison per poll; the next due time is computed
+  once per digest.
+
+Emailing these needs a hook, since the built-in `mail` fallback is plain
+`mail(1)`. This one mails everything and pops up only the interactive kinds:
+
+```python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["python-dotenv"]
+# ///
+import subprocess, sys
+sys.path.insert(0, "/abs/path/to/your/mailer")
+from notification import send_email
+
+title, body = sys.argv[1], sys.argv[2]
+kind = sys.argv[3] if len(sys.argv) > 3 else "failure"
+
+if kind != "digest":
+    urgency = "critical" if kind == "halt" else "normal"
+    subprocess.run(["notify-send", "-u", urgency, title, body], check=False)
+send_email(title, body, raise_unconfigured=False)
+```
+
+A hook replaces both built-in channels, so this one owns the desktop popup too.
+Keep the mailer's SMTP timeout short: the scheduler calls the hook
+synchronously between polls, under a 30 s cap.
 
 ## Tunables (env vars)
 
@@ -277,6 +332,7 @@ hook picks its own. The body includes the command, log path, and the log tail.
 | `QSCHED_PAUSE_SECONDS`    | 180                          | pause after a failure; also caps the failure-alert rate |
 | `QSCHED_HALT_AFTER`       | 12                           | consecutive failures before halt (0 = never) |
 | `QSCHED_POLL_SECONDS`     | 2                            | scheduler poll interval         |
+| `QSCHED_STATUS_AT`        | `8,14,20`                    | local hours for the status digest (empty = off) |
 | `QSCHED_VALIDATE_TIMEOUT` | 60                           | per-probe timeout for `--validate` |
 | `QSCHED_NOTIFY`           | `~/.config/qsched/notify.sh` | hook path                       |
 | `QSCHED_EMAIL`            | unset                        | enables mail fallback           |

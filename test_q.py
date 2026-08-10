@@ -7,6 +7,7 @@
 
 import fcntl
 import shlex
+from datetime import datetime
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -34,18 +35,21 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("QSCHED_HOME", str(tmp_path))
     monkeypatch.setenv("QSCHED_NOTIFY", str(tmp_path / "absent.sh"))
 
-    def record(title: str, body: str, urgency: str = "normal") -> None:
+    def record(title: str, body: str, kind: str = "failure") -> None:
         NOTIFICATIONS.append(title)
-        URGENCIES.append(urgency)
+        KINDS.append(kind)
+        BODIES.append(body)
 
     monkeypatch.setattr(q, "notify", record)
     NOTIFICATIONS.clear()
-    URGENCIES.clear()
+    KINDS.clear()
+    BODIES.clear()
     yield tmp_path
 
 
 NOTIFICATIONS: list[str] = []
-URGENCIES: list[str] = []
+KINDS: list[str] = []
+BODIES: list[str] = []
 
 
 def enqueue(conn: sqlite3.Connection, *argv: str) -> int:
@@ -482,14 +486,14 @@ def test_failure_notification_is_throttled_by_the_pause(
     assert len(NOTIFICATIONS) == 1
 
 
-def test_only_the_halt_is_critical(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_notification_kinds(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(q, "HALT_AFTER", 2)
     monkeypatch.setattr(q, "PAUSE_SECONDS", 0.0)
     sched = scheduler()
     for _ in range(2):
         job = enqueue(sched.conn, "false")
         sched.finalize(job, 1, home / "logs" / f"{job}.log")
-    assert URGENCIES == ["normal", "critical"]
+    assert KINDS == ["failure", "halt"]
 
 
 def test_resume_clears_pause_halt_and_streak(home: Path) -> None:
@@ -614,27 +618,26 @@ def test_cancel_running_defers_to_the_scheduler(home: Path) -> None:
 
 
 def test_probe_passes_only_with_the_sentinel(home: Path) -> None:
-    good = run_probe(["sh", "-c", SENTINEL_CMD], {}, str(home))
-    assert (good.status, good.ok) == ("pass", True)
+    assert run_probe(["sh", "-c", SENTINEL_CMD], {}, str(home)).ok
     quiet = run_probe(["sh", "-c", "echo nothing to say"], {}, str(home))
-    assert quiet.status == "unsupported"  # never silently a pass
+    assert not quiet.ok and "never printed" in quiet.reason  # never silently a pass
     assert "nothing to say" in quiet.output
 
 
 def test_probe_reports_nonzero_exit_with_output(home: Path) -> None:
     result = run_probe(["sh", "-c", "echo bad config >&2; exit 3"], {}, str(home))
-    assert (result.status, result.reason) == ("failed", "exit 3")
+    assert not result.ok and result.reason == "exit 3"
     assert "bad config" in result.output
 
 
 def test_probe_times_out(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(q, "VALIDATE_TIMEOUT", 0.3)
     result = run_probe(["sh", "-c", f"{SENTINEL_CMD}; sleep 30"], {}, str(home))
-    assert result.status == "timeout"
+    assert not result.ok and "no answer" in result.reason
 
 
 def test_probe_spawn_error(home: Path) -> None:
-    assert run_probe(["definitely-not-a-real-binary"], {}, str(home)).status == "error"
+    assert not run_probe(["definitely-not-a-real-binary"], {}, str(home)).ok
 
 
 def test_probe_env_hides_gpus_and_carries_job_env(home: Path) -> None:
@@ -654,18 +657,18 @@ def test_probes_keep_combo_order_when_parallel(home: Path) -> None:
         ["sh", "-c", "exit 1"],
         ["sh", "-c", SENTINEL_CMD],
     ]
-    results = run_probes(combos, {}, workers=3)
-    assert [r.status for r in results] == ["pass", "failed", "pass"]
+    results = run_probes(combos, {})
+    assert [r.ok for r in results] == [True, False, True]
 
 
 def test_validated_combos_all_bad_aborts(home: Path) -> None:
     with pytest.raises(SystemExit):
-        validated_combos([["false"], ["false"]], {}, workers=2, assume_yes=True)
+        validated_combos([["false"], ["false"]], {}, "skip")
 
 
 def test_validated_combos_keeps_survivors_with_yes(home: Path) -> None:
     combos = [["sh", "-c", SENTINEL_CMD], ["false"]]
-    assert validated_combos(combos, {}, workers=2, assume_yes=True) == [combos[0]]
+    assert validated_combos(combos, {}, "skip") == [combos[0]]
 
 
 def test_validated_combos_declined_enqueues_nothing(
@@ -673,21 +676,19 @@ def test_validated_combos_declined_enqueues_nothing(
 ) -> None:
     monkeypatch.setattr(q, "prompt_yes", lambda question, timeout: False)
     with pytest.raises(SystemExit):
-        validated_combos(
-            [["sh", "-c", SENTINEL_CMD], ["false"]], {}, workers=2, assume_yes=False
-        )
+        validated_combos([["sh", "-c", SENTINEL_CMD], ["false"]], {}, "ask")
 
 
 def test_add_with_validate_enqueues_nothing_on_rejection(home: Path) -> None:
     with pytest.raises(SystemExit):
-        q.cmd_add([], ["false"], validate=True, assume_yes=True)
+        q.cmd_add([], ["false"], validate=True, on_reject="skip")
     assert q.db().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
 
 
 def test_sweep_with_validate_enqueues_only_survivors(home: Path) -> None:
     script = f'test "$1" = "V=ok" && {SENTINEL_CMD}'
     command = ["sh", "-c", script, "probe", "V=ok,bad"]
-    q.cmd_sweep([], command, dry_run=False, validate=True, assume_yes=True)
+    q.cmd_sweep([], command, dry_run=False, validate=True, on_reject="skip")
     rows = q.db().execute("SELECT argv FROM jobs").fetchall()
     assert len(rows) == 1 and "V=ok" in rows[0]["argv"]
 
@@ -701,6 +702,98 @@ def test_sweep_dry_run_with_validate_reports_and_exits_nonzero(
     assert captured.out.strip() == "false"  # stdout stays paste-able
     assert "0 passed, 1 rejected" in captured.err
     assert q.db().execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+# --------------------------------------------------------------- status digest
+
+
+def test_next_digest_after_picks_the_next_listed_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(q, "STATUS_HOURS", [8, 14, 20])
+    at = datetime(2026, 6, 1, 9, 30).timestamp()
+    assert datetime.fromtimestamp(q.next_digest_after(at)).hour == 14
+    at = datetime(2026, 6, 1, 21, 0).timestamp()
+    tomorrow = datetime.fromtimestamp(q.next_digest_after(at))
+    assert (tomorrow.day, tomorrow.hour) == (2, 8)
+
+
+def test_digest_off_when_no_hours_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(q, "STATUS_HOURS", [])
+    assert q.next_digest_after(time.time()) == float("inf")
+    assert q._status_hours("") == []
+
+
+def test_status_hours_rejects_nonsense() -> None:
+    assert q._status_hours("20,8,8") == [8, 20]
+    with pytest.raises(SystemExit):
+        q._status_hours("8,24")
+    with pytest.raises(SystemExit):
+        q._status_hours("8pm")
+
+
+def test_digest_waits_until_due(home: Path) -> None:
+    sched = scheduler()
+    enqueue(sched.conn, "true")
+    now = time.time()
+    sched.digest_due = now + 3600
+    sched.maybe_digest(now)
+    assert NOTIFICATIONS == []
+    sched.digest_due = now - 1
+    sched.maybe_digest(now)
+    assert len(NOTIFICATIONS) == 1
+
+
+def test_digest_carries_the_standard_status_view(home: Path) -> None:
+    sched = scheduler()
+    job = enqueue(sched.conn, "true")
+    sched.digest_due = time.time() - 1
+    sched.maybe_digest(time.time())
+    assert KINDS == ["digest"]
+    assert "queued 1  (1 total)" in NOTIFICATIONS[0]
+    assert BODIES[0] == q.render_status(False)
+    assert f"{job:>5} queued" in BODIES[0]
+
+
+def test_digest_reschedules_to_the_next_hour(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(q, "STATUS_HOURS", [8, 14, 20])
+    sched = scheduler()
+    enqueue(sched.conn, "true")
+    sched.digest_due = time.time() - 1
+    sched.maybe_digest(time.time())
+    assert datetime.fromtimestamp(sched.digest_due).hour in (8, 14, 20)
+    assert sched.digest_due > time.time()
+
+
+def test_digest_stays_silent_while_idle(home: Path) -> None:
+    sched = scheduler()
+    job = enqueue(sched.conn, "true")
+    sched.conn.execute(
+        "UPDATE jobs SET state='done', finished_at=? WHERE id=?", (time.time(), job)
+    )
+    sched.conn.commit()
+    sched.digest_due = time.time() - 1
+    sched.maybe_digest(time.time())  # reports the job that settled
+    assert len(NOTIFICATIONS) == 1
+    sched.digest_due = time.time() - 1
+    sched.maybe_digest(time.time())  # nothing since: silent
+    assert len(NOTIFICATIONS) == 1
+
+
+def test_hook_receives_title_body_and_kind(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.undo()  # restore the real notify()
+    monkeypatch.setenv("QSCHED_HOME", str(home))
+    hook = home / "notify.sh"
+    record = home / "hook-args"
+    hook.write_text(f'#!/bin/sh\nprintf "%s|%s" "$1" "$3" > {record}\n')
+    hook.chmod(0o755)
+    monkeypatch.setenv("QSCHED_NOTIFY", str(hook))
+    q.notify("t", "b", kind="digest")
+    assert record.read_text() == "t|digest"
 
 
 if __name__ == "__main__":
