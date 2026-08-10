@@ -3,17 +3,18 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""qsched — minimal GPU job queue for a single machine.
+r"""qsched — minimal GPU job queue for a single machine.
 
 One SQLite database holds the queue; `q run` is a foreground scheduler that
 dispatches queued jobs onto free GPUs (one GPU per job, exact bookkeeping, no
 nvidia-smi heuristics). The CLI works whether or not the scheduler is running.
 
 Commands:
-    q add   [--env K=V ...] -- <command ...>     enqueue one job
-    q sweep [--env K=V ...] [-n] -- <command ...> expand hydra-style sweeps,
+    q add   [--env K=V ...] [--validate] -- <cmd ...>  enqueue one job
+    q sweep [--env K=V ...] [-n] [--validate] -- <cmd ...>
+                                                  expand hydra-style sweeps,
                                                   enqueue one job per combo
-    q run   [--gpus 0,1,2]                        start the scheduler
+    q run   [--gpus 0,2,1]                        start the scheduler
     q status [--all]                              show the queue
     q logs <id> [-f]                              show/follow a job's log
     q show <id> [-r]                              print cmd/env/cwd (-r: q add line)
@@ -47,10 +48,23 @@ then enqueues the cartesian product over all tokens:
     'key="a,b"'                                          -> 1 variant (quoted comma)
     'model=xgb01,xgb02' 'lr=0.1,0.01'                    -> 4 jobs
 
+A token is only a candidate for splitting if its key matches
+[+~]{0,2}[\w.@/:]+ — so 'my-key=a,b' and 'paths[0]=a,b' are left alone.
 Tokens starting with '-' and tokens without '=' are never split. Backslash
 escapes are not understood by the splitter — use quotes. Hydra's range()/
-glob()/choice() sweeps are not expanded; do that expansion in your submission
+glob()/sweeper plugins are not expanded; do that expansion in your submission
 script. Use `q sweep -n -- ...` (dry run) to inspect the expansion.
+
+VALIDATION PROBES
+=================
+With --validate, every job is run once before it is enqueued with
+QSCHED_VALIDATE=1 in its environment (argv is untouched) and no GPUs visible,
+so a cooperating target can validate its config and fail fast. A probe passes
+only if it exits 0 AND prints the sentinel `qsched: validated`; a target that
+ignores the variable is reported as unsupported rather than silently passing.
+Probes run in parallel, each under QSCHED_VALIDATE_TIMEOUT seconds. If some
+fail you are asked whether to enqueue the survivors (default yes after 100 s;
+--yes answers up front, for submission scripts).
 
 Environment variables go through --env (repeatable), never shell prefixes:
 
@@ -66,8 +80,9 @@ A job exiting nonzero is immediately given the unattended default (its GPU
 frees up): if it has never had an unattended retry it is requeued at the BACK
 of the queue with retries=1; otherwise it is marked `failed` permanently.
 You are notified (hook/notify-send/mail) and dispatch of NEW jobs pauses for
-QSCHED_PAUSE_SECONDS (default 300) — running jobs continue. During (or after)
-the pause you can override the default:
+QSCHED_PAUSE_SECONDS (default 180) — running jobs continue. At most one
+failure notification is sent per pause window, and none at all while halted.
+During (or after) the pause you can override the default:
 
   1. `q fixed <id> [...]` — you fixed it: the job moves to the FRONT of the
      queue (ahead of everything queued, behind whatever is already running),
@@ -99,23 +114,28 @@ import fcntl
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 from shutil import which
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
 HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "12"))  # 0 disables halting
 POLL_SECONDS = float(os.environ.get("QSCHED_POLL_SECONDS", "2"))
 CANCEL_GRACE_SECONDS = 10.0
+VALIDATE_TIMEOUT = float(os.environ.get("QSCHED_VALIDATE_TIMEOUT", "60"))
+VALIDATE_SENTINEL = "qsched: validated"
+VALIDATE_PROMPT_SECONDS = 100.0
 
 
 def qsched_home() -> Path:
@@ -317,27 +337,181 @@ def clear_pause(conn: sqlite3.Connection) -> None:
     ctl_set(conn, "fail_streak", "0")
 
 
-def cmd_add(env_pairs: list[str], command: list[str]) -> None:
+# ------------------------------------------------------------ validation probes
+
+ProbeStatus = Literal["pass", "failed", "unsupported", "timeout", "error"]
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    argv: list[str]
+    status: ProbeStatus
+    reason: str
+    output: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "pass"
+
+
+def _output_tail(text: str, max_lines: int = 40) -> str:
+    return "\n".join(text.strip().splitlines()[-max_lines:])
+
+
+def run_probe(argv: list[str], env: dict[str, str], cwd: str) -> ProbeResult:
+    """Run one job in validation mode: no GPUs, real cwd/env, sentinel required."""
+    probe_env = {
+        **base_env(),
+        **env,
+        "QSCHED_VALIDATE": "1",
+        "CUDA_VISIBLE_DEVICES": "",
+    }
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=probe_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return ProbeResult(argv, "error", str(exc))
+    try:
+        raw, _ = proc.communicate(timeout=VALIDATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc.pid, signal.SIGKILL)
+        raw, _ = proc.communicate()
+        return ProbeResult(
+            argv,
+            "timeout",
+            f"no verdict within {VALIDATE_TIMEOUT:.0f}s",
+            _output_tail(raw.decode(errors="replace")),
+        )
+    output = raw.decode(errors="replace")
+    if proc.returncode != 0:
+        return ProbeResult(
+            argv, "failed", f"exit {proc.returncode}", _output_tail(output)
+        )
+    if VALIDATE_SENTINEL not in output:
+        return ProbeResult(
+            argv,
+            "unsupported",
+            f"exit 0 but never printed {VALIDATE_SENTINEL!r}",
+            _output_tail(output),
+        )
+    return ProbeResult(argv, "pass", "ok")
+
+
+def run_probes(
+    combos: list[list[str]], env: dict[str, str], workers: int = 0
+) -> list[ProbeResult]:
+    """Probe every combo in parallel; results stay in combo order."""
+    cwd = os.getcwd()
+    workers = workers if workers > 0 else min(8, os.cpu_count() or 1)
+    if workers == 1 or len(combos) == 1:
+        return [run_probe(combo, env, cwd) for combo in combos]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda combo: run_probe(combo, env, cwd), combos))
+
+
+def report_probes(results: list[ProbeResult]) -> None:
+    rejected = [r for r in results if not r.ok]
+    passed = len(results) - len(rejected)
+    print(
+        f"-- validated {len(results)} job(s): {passed} passed, {len(rejected)} rejected",
+        file=sys.stderr,
+    )
+    for result in rejected:
+        print(
+            f"\n!! {result.status} ({result.reason}): {shlex.join(result.argv)}",
+            file=sys.stderr,
+        )
+        if result.output:
+            print(f"   --- output tail ---\n{result.output}", file=sys.stderr)
+
+
+def prompt_yes(question: str, timeout: float) -> bool:
+    """Ask on stdin; a closed stdin or an expired timeout both mean yes."""
+    print(f"{question} [Y/n] (yes in {timeout:.0f}s): ", end="", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        print("\n-- timed out, proceeding")
+        return True
+    answer = sys.stdin.readline()
+    print()
+    return answer.strip().lower() in ("", "y", "yes")
+
+
+def validated_combos(
+    combos: list[list[str]], env: dict[str, str], workers: int, assume_yes: bool
+) -> list[list[str]]:
+    """Probe, report, and return the combos that may be enqueued."""
+    results = run_probes(combos, env, workers)
+    if all(result.ok for result in results):
+        return combos
+    report_probes(results)
+    survivors = [result.argv for result in results if result.ok]
+    if not survivors:
+        raise SystemExit(f"all {len(combos)} job(s) rejected — nothing enqueued")
+    if not assume_yes and not prompt_yes(
+        f"enqueue the {len(survivors)} job(s) that passed?", VALIDATE_PROMPT_SECONDS
+    ):
+        raise SystemExit("nothing enqueued")
+    return survivors
+
+
+# -------------------------------------------------------------------- submission
+
+
+def cmd_add(
+    env_pairs: list[str],
+    command: list[str],
+    validate: bool = False,
+    assume_yes: bool = False,
+    workers: int = 0,
+) -> None:
     if not command:
         raise SystemExit("no command given (usage: q add [--env K=V] -- cmd ...)")
+    env = parse_env_pairs(env_pairs)
+    if validate:
+        validated_combos([command], env, workers, assume_yes)
     conn = db()
-    job_id = insert_job(conn, command, parse_env_pairs(env_pairs))
+    job_id = insert_job(conn, command, env)
     print(f"enqueued job {job_id}: {shlex.join(command)}")
 
 
-def cmd_sweep(env_pairs: list[str], command: list[str], dry_run: bool) -> None:
+def cmd_sweep(
+    env_pairs: list[str],
+    command: list[str],
+    dry_run: bool,
+    validate: bool = False,
+    assume_yes: bool = False,
+    workers: int = 0,
+) -> None:
     if not command:
         raise SystemExit(
             "no command given (usage: q sweep [--env K=V] [-n] -- cmd ...)"
         )
     combos = expand_sweep(command)
-    if dry_run:
-        for combo in combos:
-            print(shlex.join(combo))
-        print(f"-- dry run: {len(combos)} job(s), nothing enqueued", file=sys.stderr)
-        return
-    conn = db()
     env = parse_env_pairs(env_pairs)
+    if dry_run:
+        for combo in combos:  # stdout stays paste-able; verdicts go to stderr
+            print(shlex.join(combo))
+        if not validate:
+            print(
+                f"-- dry run: {len(combos)} job(s), nothing enqueued", file=sys.stderr
+            )
+            return
+        results = run_probes(combos, env, workers)
+        report_probes(results)
+        print("-- dry run: nothing enqueued", file=sys.stderr)
+        if any(not result.ok for result in results):
+            raise SystemExit(1)
+        return
+    if validate:
+        combos = validated_combos(combos, env, workers, assume_yes)
+    conn = db()
     ids = [insert_job(conn, combo, env) for combo in combos]
     print(f"enqueued {len(ids)} job(s): ids {ids[0]}..{ids[-1]}")
 
@@ -345,7 +519,8 @@ def cmd_sweep(env_pairs: list[str], command: list[str], dry_run: bool) -> None:
 # ------------------------------------------------------------------ notifications
 
 
-def notify(title: str, body: str) -> None:
+def notify(title: str, body: str, urgency: str = "normal") -> None:
+    """Only a halt is `critical` — per-failure alerts must self-dismiss."""
     try:
         hook = notify_hook()
         if hook.is_file() and os.access(hook, os.X_OK):
@@ -353,7 +528,7 @@ def notify(title: str, body: str) -> None:
             return
         if which("notify-send"):
             subprocess.run(
-                ["notify-send", "-u", "critical", title, body], timeout=10, check=False
+                ["notify-send", "-u", urgency, title, body], timeout=10, check=False
             )
         email = os.environ.get("QSCHED_EMAIL")
         if email and which("mail"):
@@ -550,6 +725,7 @@ class Scheduler:
                 f"dispatch stopped until `q fixed <id> [...]` or `q resume`.\n"
                 f"Latest: job {job_id} (exit {exit_code}), {outcome}.\n"
                 f"log: {log_path}\n\n--- log tail ---\n{log_tail(log_path)}",
+                urgency="critical",
             )
             return
         if already_halted:
@@ -1129,8 +1305,31 @@ def main(argv: list[str] | None = None) -> None:
     p_sweep.add_argument("--env", action="append", default=[], metavar="K=V")
     p_sweep.add_argument("-n", "--dry-run", action="store_true")
 
+    for p_submit in (p_add, p_sweep):
+        p_submit.add_argument(
+            "--validate",
+            action="store_true",
+            help="probe each job with QSCHED_VALIDATE=1 before enqueuing",
+        )
+        p_submit.add_argument(
+            "-j",
+            "--jobs",
+            type=int,
+            default=0,
+            metavar="N",
+            help="parallel validation probes (0 = auto)",
+        )
+        p_submit.add_argument(
+            "-y",
+            "--yes",
+            action="store_true",
+            help="enqueue survivors without prompting when probes fail",
+        )
+
     p_run = sub.add_parser("run", help="start the scheduler (foreground)")
-    p_run.add_argument("--gpus", default="0,2,1", help="comma-separated GPU ids")
+    p_run.add_argument(
+        "--gpus", default="0,2,1", help="GPU ids, in dispatch preference order"
+    )
 
     p_status = sub.add_parser("status", help="show the queue")
     p_status.add_argument("--all", action="store_true")
@@ -1185,9 +1384,9 @@ def main(argv: list[str] | None = None) -> None:
     ns = parser.parse_args(before)
     match ns.cmd:
         case "add":
-            cmd_add(ns.env, command)
+            cmd_add(ns.env, command, ns.validate, ns.yes, ns.jobs)
         case "sweep":
-            cmd_sweep(ns.env, command, ns.dry_run)
+            cmd_sweep(ns.env, command, ns.dry_run, ns.validate, ns.yes, ns.jobs)
         case "run":
             cmd_run([int(g) for g in str(ns.gpus).split(",") if g != ""])
         case "status":
