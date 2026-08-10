@@ -27,7 +27,7 @@ from q import (
     validated_combos,
 )
 
-SENTINEL_CMD = f"echo {q.VALIDATE_SENTINEL}"
+VALID_CMD = f"exit {q.VALIDATE_OK_CODE}"
 
 
 @pytest.fixture
@@ -617,11 +617,12 @@ def test_cancel_running_defers_to_the_scheduler(home: Path) -> None:
 # ------------------------------------------------------------ validation probes
 
 
-def test_probe_passes_only_with_the_sentinel(home: Path) -> None:
-    assert run_probe(["sh", "-c", SENTINEL_CMD], {}, str(home)).ok
-    quiet = run_probe(["sh", "-c", "echo nothing to say"], {}, str(home))
-    assert not quiet.ok and "never printed" in quiet.reason  # never silently a pass
-    assert "nothing to say" in quiet.output
+def test_probe_passes_only_on_the_agreed_exit_code(home: Path) -> None:
+    assert run_probe(["sh", "-c", VALID_CMD], {}, str(home)).ok
+    # a target that ignores QSCHED_VALIDATE exits 0: never silently a pass
+    unaware = run_probe(["sh", "-c", "echo ran the real job"], {}, str(home))
+    assert not unaware.ok and "expected 80" in unaware.reason
+    assert "ran the real job" in unaware.output
 
 
 def test_probe_reports_nonzero_exit_with_output(home: Path) -> None:
@@ -630,9 +631,15 @@ def test_probe_reports_nonzero_exit_with_output(home: Path) -> None:
     assert "bad config" in result.output
 
 
+def test_probe_ok_code_is_not_confused_with_failure(home: Path) -> None:
+    assert q.VALIDATE_OK_CODE not in (0, 1, 2, 126, 127)  # no convention claims it
+    assert run_probe(["sh", "-c", "exit 79"], {}, str(home)).reason == "exit 79"
+    assert run_probe(["sh", "-c", "exit 81"], {}, str(home)).reason == "exit 81"
+
+
 def test_probe_times_out(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(q, "VALIDATE_TIMEOUT", 0.3)
-    result = run_probe(["sh", "-c", f"{SENTINEL_CMD}; sleep 30"], {}, str(home))
+    result = run_probe(["sh", "-c", "sleep 30"], {}, str(home))
     assert not result.ok and "no answer" in result.reason
 
 
@@ -645,7 +652,7 @@ def test_probe_env_hides_gpus_and_carries_job_env(home: Path) -> None:
         "sh",
         "-c",
         f'echo "V=$QSCHED_VALIDATE CUDA=[$CUDA_VISIBLE_DEVICES] R=$REGION P=$PWD"; '
-        f"{SENTINEL_CMD}; exit 1",
+        f"exit 1",
     ]
     result = run_probe(argv, {"REGION": "US3"}, str(home))
     assert f"V=1 CUDA=[] R=US3 P={home}" in result.output
@@ -653,9 +660,9 @@ def test_probe_env_hides_gpus_and_carries_job_env(home: Path) -> None:
 
 def test_probes_keep_combo_order_when_parallel(home: Path) -> None:
     combos = [
-        ["sh", "-c", f"sleep 0.3; {SENTINEL_CMD}"],
+        ["sh", "-c", f"sleep 0.3; {VALID_CMD}"],
         ["sh", "-c", "exit 1"],
-        ["sh", "-c", SENTINEL_CMD],
+        ["sh", "-c", VALID_CMD],
     ]
     results = run_probes(combos, {})
     assert [r.ok for r in results] == [True, False, True]
@@ -667,7 +674,7 @@ def test_validated_combos_all_bad_aborts(home: Path) -> None:
 
 
 def test_validated_combos_keeps_survivors_with_yes(home: Path) -> None:
-    combos = [["sh", "-c", SENTINEL_CMD], ["false"]]
+    combos = [["sh", "-c", VALID_CMD], ["false"]]
     assert validated_combos(combos, {}, "skip") == [combos[0]]
 
 
@@ -676,7 +683,7 @@ def test_validated_combos_declined_enqueues_nothing(
 ) -> None:
     monkeypatch.setattr(q, "prompt_yes", lambda question, timeout: False)
     with pytest.raises(SystemExit):
-        validated_combos([["sh", "-c", SENTINEL_CMD], ["false"]], {}, "ask")
+        validated_combos([["sh", "-c", VALID_CMD], ["false"]], {}, "ask")
 
 
 def test_add_with_validate_enqueues_nothing_on_rejection(home: Path) -> None:
@@ -686,7 +693,7 @@ def test_add_with_validate_enqueues_nothing_on_rejection(home: Path) -> None:
 
 
 def test_sweep_with_validate_enqueues_only_survivors(home: Path) -> None:
-    script = f'test "$1" = "V=ok" && {SENTINEL_CMD}'
+    script = f'test "$1" = "V=ok" && {VALID_CMD}'
     command = ["sh", "-c", script, "probe", "V=ok,bad"]
     q.cmd_sweep([], command, dry_run=False, validate=True, on_reject="skip")
     rows = q.db().execute("SELECT argv FROM jobs").fetchall()

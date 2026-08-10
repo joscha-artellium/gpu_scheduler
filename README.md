@@ -103,25 +103,38 @@ q sweep --validate -- uv run python scripts/train_predict.py model=xgb01,xgb02
 
 ### What your target has to do
 
-`q` runs each job once with `QSCHED_VALIDATE=1` in the environment. **Your
-argv is not changed** — no extra flag to declare in your config schema. Read
-the variable, check the config, print `qsched: validated`, exit 0:
+`q` runs each job once with `QSCHED_VALIDATE=1` in the environment. **Your argv
+is not changed** — no extra flag to declare in your config schema. Read the
+variable, check the config, and exit **80**:
 
 ```python
-if os.environ.get("QSCHED_VALIDATE"):
-    cfg = compose_and_check()          # raise / sys.exit(1) if anything is wrong
-    print("qsched: validated")
-    raise SystemExit(0)
+if os.environ.get("QSCHED_VALIDATE") == "1":
+    exit_code = validate_config(cfg_obj)
+    if exit_code:
+        logger.exception("config is invalid")
+        raise SystemExit(exit_code)
+    logger.info("config validated")
+    raise SystemExit(80)
 ```
 
-**Both parts are required.** Exit 0 without the sentinel counts as a rejection
-("never printed 'qsched: validated'") — otherwise a target that has never heard
-of `QSCHED_VALIDATE` would run its real workload as its own probe and be
-declared valid.
+Exit **80** = valid. Any **other nonzero** = invalid, and the code is shown as
+the reason. Exit **0** is a rejection too (`exit 0, expected 80 — does it
+support validation?`): a target that has never heard of `QSCHED_VALIDATE`
+ignores it, runs the real job, and exits 0, so treating that as a pass would
+validate nothing.
 
-Probes get `CUDA_VISIBLE_DEVICES=""` (a probe can never take VRAM from a
-running job), your recorded cwd, and your `--env` values. They run in parallel,
-each capped at `QSCHED_VALIDATE_TIMEOUT` seconds (default 60).
+Nothing needs printing. The verdict is the exit code alone, so your logging
+setup — levels, handlers, file-only routing under hydra — cannot affect it. Log
+whatever you like for your own benefit; on rejection `q` shows the last 40
+lines of the probe's combined stdout+stderr next to the failing command, so a
+clear message there is worth writing.
+
+Under hydra, put this at the top of the `@hydra.main` function body:
+composition has already happened, so a bad override key raises before your code
+runs — exactly the failure you want caught.
+
+80 is `VALIDATE_OK_CODE` in `q.py`, one constant to change if it ever collides
+with something your framework already uses.
 
 ### What happens when something is rejected
 

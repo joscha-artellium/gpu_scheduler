@@ -60,8 +60,9 @@ VALIDATION PROBES
 With --validate, every job is run once before it is enqueued with
 QSCHED_VALIDATE=1 in its environment (argv is untouched) and no GPUs visible,
 so a cooperating target can validate its config and fail fast. A probe passes
-only if it exits 0 AND prints the sentinel `qsched: validated`. Probes run in
-parallel, each under QSCHED_VALIDATE_TIMEOUT seconds. When some are rejected,
+only if it exits VALIDATE_OK_CODE (80); exiting 0 means the target ignored the
+variable and ran for real. Probes run in parallel, each under
+QSCHED_VALIDATE_TIMEOUT seconds. When some are rejected,
 --on-reject decides: ask (default, yes after 100 s), skip (enqueue the rest),
 or abort (enqueue nothing).
 
@@ -144,7 +145,7 @@ def _status_hours(spec: str) -> list[int]:
     return hours
 
 
-STATUS_HOURS = _status_hours(os.environ.get("QSCHED_STATUS_AT", "7,20"))
+STATUS_HOURS = _status_hours(os.environ.get("QSCHED_STATUS_AT", "8,14,20"))
 
 
 def next_digest_after(moment: float) -> float:
@@ -165,8 +166,8 @@ def next_digest_after(moment: float) -> float:
 
 CANCEL_GRACE_SECONDS = 10.0
 VALIDATE_TIMEOUT = float(os.environ.get("QSCHED_VALIDATE_TIMEOUT", "60"))
-VALIDATE_SENTINEL = "qsched: validated"
-VALIDATE_PROMPT_SECONDS = 60.0
+VALIDATE_OK_CODE = 80  # 79-125 is unclaimed by sysexits/shell/signal codes
+VALIDATE_PROMPT_SECONDS = 100.0
 
 
 def qsched_home() -> Path:
@@ -409,13 +410,14 @@ def run_probe(argv: list[str], env: dict[str, str], cwd: str) -> ProbeResult:
         raw, _ = proc.communicate()
         tail = _output_tail(raw.decode(errors="replace"))
         return ProbeResult(argv, False, f"no answer in {VALIDATE_TIMEOUT:.0f}s", tail)
-    output = raw.decode(errors="replace")
-    if proc.returncode != 0:
-        return ProbeResult(argv, False, f"exit {proc.returncode}", _output_tail(output))
-    if VALIDATE_SENTINEL not in output:
-        reason = f"exit 0 but never printed {VALIDATE_SENTINEL!r}"
-        return ProbeResult(argv, False, reason, _output_tail(output))
-    return ProbeResult(argv, True)
+    if proc.returncode == VALIDATE_OK_CODE:
+        return ProbeResult(argv, True)
+    output = _output_tail(raw.decode(errors="replace"))
+    if proc.returncode == 0:
+        # a target that ignores QSCHED_VALIDATE just ran the real job: not a pass
+        reason = f"exit 0, expected {VALIDATE_OK_CODE} — does it support validation?"
+        return ProbeResult(argv, False, reason, output)
+    return ProbeResult(argv, False, f"exit {proc.returncode}", output)
 
 
 def run_probes(combos: list[list[str]], env: dict[str, str]) -> list[ProbeResult]:
