@@ -796,11 +796,11 @@ def test_hook_receives_title_body_and_kind(
     monkeypatch.setenv("QSCHED_HOME", str(home))
     hook = home / "notify.sh"
     record = home / "hook-args"
-    hook.write_text(f'#!/bin/sh\nprintf "%s|%s" "$1" "$3" > {record}\n')
+    hook.write_text(f'#!/bin/sh\nprintf "%s|%s" "$2" "$3" > {record}\n')
     hook.chmod(0o755)
     monkeypatch.setenv("QSCHED_NOTIFY", str(hook))
     q.notify("t", "b", kind="digest")
-    assert record.read_text() == "t|digest"
+    assert record.read_text() == "[DIGEST] t|b"
 
 
 if __name__ == "__main__":

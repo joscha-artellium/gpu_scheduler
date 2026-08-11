@@ -167,7 +167,7 @@ def next_digest_after(moment: float) -> float:
 CANCEL_GRACE_SECONDS = 10.0
 VALIDATE_TIMEOUT = float(os.environ.get("QSCHED_VALIDATE_TIMEOUT", "60"))
 VALIDATE_OK_CODE = 80  # 79-125 is unclaimed by sysexits/shell/signal codes
-VALIDATE_PROMPT_SECONDS = 100.0
+VALIDATE_PROMPT_SECONDS = 60.0
 
 
 def qsched_home() -> Path:
@@ -187,9 +187,7 @@ def lock_path() -> Path:
 
 
 def notify_hook() -> Path:
-    return Path(
-        os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".config/qsched/notify.sh"))
-    )
+    return Path(os.environ.get("QSCHED_NOTIFY", str(Path.home() / ".local/bin/notify")))
 
 
 ACTIVE_STATES = ("queued", "running", "canceling", "restarting")
@@ -536,21 +534,14 @@ def notify(title: str, body: str, kind: str = "failure") -> None:
     try:
         hook = notify_hook()
         if hook.is_file() and os.access(hook, os.X_OK):
-            subprocess.run([str(hook), title, body, kind], timeout=30, check=False)
-            return
+            tag = {"failure": "ALERT", "halt": "ALERT"}.get(kind, kind.upper())
+            tt = f"[{tag}] {title}"
+            subprocess.run([str(hook), "--", tt, body], timeout=30, check=False)
         # a periodic digest as a desktop popup is noise; email only
         if kind != "digest" and which("notify-send"):
             urgency = "critical" if kind == "halt" else "normal"
             subprocess.run(
                 ["notify-send", "-u", urgency, title, body], timeout=10, check=False
-            )
-        email = os.environ.get("QSCHED_EMAIL")
-        if email and which("mail"):
-            subprocess.run(
-                ["mail", "-s", title, email],
-                input=body.encode(),
-                timeout=30,
-                check=False,
             )
     except Exception as exc:  # notification failure must never take down dispatch
         print(f"[qsched] notify failed: {exc}", file=sys.stderr)
