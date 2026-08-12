@@ -318,13 +318,109 @@ def test_finalize_honours_canceling_and_restarting(home: Path) -> None:
     assert q.ctl_get(sched.conn, "fail_streak", "0") == "0"  # neither is a failure
 
 
-def test_restart_requires_ids_or_all(home: Path) -> None:
+def test_restart_requires_ids_or_a_selector(home: Path) -> None:
     conn = q.db()
     enqueue(conn, "true")
     with pytest.raises(SystemExit):
-        q.cmd_restart([], restart_all=False)
+        q.cmd_restart([], [])
     with pytest.raises(SystemExit):
-        q.cmd_restart([1], restart_all=True)
+        q.cmd_restart([1], ["running"])
+
+
+def test_restart_running_defers_to_the_scheduler(home: Path) -> None:
+    conn = q.db()
+    job = enqueue(conn, "true")
+    rank = conn.execute("SELECT rank FROM jobs WHERE id=?", (job,)).fetchone()["rank"]
+    conn.execute("UPDATE jobs SET state='running', retries=1 WHERE id=?", (job,))
+    conn.commit()
+    q.cmd_restart([job], [])
+    row = q.db().execute("SELECT * FROM jobs WHERE id=?", (job,)).fetchone()
+    assert (row["state"], row["rank"], row["retries"]) == ("restarting", rank, 1)
+
+
+def test_restart_undoes_an_in_flight_cancel(home: Path) -> None:
+    conn = q.db()
+    job = enqueue(conn, "true")
+    conn.execute("UPDATE jobs SET state='running' WHERE id=?", (job,))
+    conn.commit()
+    q.cmd_cancel([job])
+    q.cmd_restart([job], [])
+    assert state_of(q.db(), job) == "restarting"
+
+
+def test_restart_loses_the_race_against_a_settled_cancel(home: Path) -> None:
+    """The scheduler finalized the cancel first: the terminal path takes over."""
+    conn = q.db()
+    job = enqueue(conn, "true")
+    conn.execute(
+        "UPDATE jobs SET state='canceled', finished_at=? WHERE id=?",
+        (time.time(), job),
+    )
+    conn.commit()
+    q.cmd_restart([job], [])
+    assert state_of(q.db(), job) == "queued"
+
+
+def test_restart_canceled_goes_to_the_back_and_resets_the_row(home: Path) -> None:
+    conn = q.db()
+    canceled, queued = enqueue(conn, "true"), enqueue(conn, "true")
+    conn.execute(
+        "UPDATE jobs SET state='canceled', retries=1, gpu=2, pid=999, exit_code=143, "
+        "started_at=?, finished_at=? WHERE id=?",
+        (time.time(), time.time(), canceled),
+    )
+    conn.commit()
+    q.cmd_restart([canceled], [])
+    row = q.db().execute("SELECT * FROM jobs WHERE id=?", (canceled,)).fetchone()
+    assert (row["state"], row["retries"], row["exit_code"]) == ("queued", 0, None)
+    assert (row["gpu"], row["pid"], row["started_at"], row["finished_at"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    order = [
+        int(r["id"]) for r in q.db().execute("SELECT id FROM jobs ORDER BY rank, id")
+    ]
+    assert order == [queued, canceled]
+
+
+def test_restart_preserves_listed_order_at_the_back(home: Path) -> None:
+    conn = q.db()
+    ids = [enqueue(conn, "true") for _ in range(3)]
+    conn.execute("UPDATE jobs SET state='done' WHERE id IN (?,?)", (ids[0], ids[1]))
+    conn.commit()
+    q.cmd_restart([ids[1], ids[0]], [])
+    order = [
+        int(r["id"]) for r in q.db().execute("SELECT id FROM jobs ORDER BY rank, id")
+    ]
+    assert order == [ids[2], ids[1], ids[0]]
+
+
+def test_restart_queued_job_is_a_no_op(home: Path) -> None:
+    conn = q.db()
+    job, other = enqueue(conn, "true"), enqueue(conn, "true")
+    rank = conn.execute("SELECT rank FROM jobs WHERE id=?", (job,)).fetchone()["rank"]
+    q.cmd_restart([job], [])
+    row = q.db().execute("SELECT state, rank FROM jobs WHERE id=?", (job,)).fetchone()
+    assert (row["state"], row["rank"]) == ("queued", rank)
+    assert state_of(q.db(), other) == "queued"
+
+
+def test_restart_selectors_pick_exactly_those_states(home: Path) -> None:
+    conn = q.db()
+    states = ("done", "failed", "canceled", "queued")
+    ids = {state: enqueue(conn, "true") for state in states}
+    for state, job_id in ids.items():
+        conn.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
+    conn.commit()
+    q.cmd_restart([], ["failed", "canceled"])
+    settled = {
+        state: state_of(q.db(), job_id)
+        for state, job_id in ids.items()
+        if state in ("done", "failed", "canceled")
+    }
+    assert settled == {"done": "done", "failed": "queued", "canceled": "queued"}
 
 
 # ------------------------------------------------------------------ end-to-end
@@ -527,7 +623,7 @@ def test_fixed_clears_a_halt(home: Path) -> None:
     assert q.ctl_get(q.db(), "halted", "0") == "0"
 
 
-def test_requeue_failed_resets_retries_and_goes_to_the_back(home: Path) -> None:
+def test_restart_failed_resets_retries_and_goes_to_the_back(home: Path) -> None:
     conn = q.db()
     failed, queued = enqueue(conn, "false"), enqueue(conn, "true")
     conn.execute(
@@ -536,7 +632,7 @@ def test_requeue_failed_resets_retries_and_goes_to_the_back(home: Path) -> None:
         (time.time(), failed),
     )
     conn.commit()
-    q.cmd_requeue_failed()
+    q.cmd_restart([], ["failed"])
     row = q.db().execute("SELECT * FROM jobs WHERE id=?", (failed,)).fetchone()
     assert (row["state"], row["retries"], row["exit_code"]) == ("queued", 0, None)
     order = [
@@ -545,15 +641,24 @@ def test_requeue_failed_resets_retries_and_goes_to_the_back(home: Path) -> None:
     assert order == [queued, failed]
 
 
-def test_requeue_failed_spares_canceled_and_keeps_a_halt(home: Path) -> None:
+def test_main_maps_restart_flags_to_states(home: Path) -> None:
     conn = q.db()
-    canceled = enqueue(conn, "true")
-    conn.execute("UPDATE jobs SET state='canceled' WHERE id=?", (canceled,))
+    failed, done = enqueue(conn, "false"), enqueue(conn, "true")
+    conn.execute("UPDATE jobs SET state='failed' WHERE id=?", (failed,))
+    conn.execute("UPDATE jobs SET state='done' WHERE id=?", (done,))
+    conn.commit()
+    q.main(["restart", "--failed"])
+    assert (state_of(q.db(), failed), state_of(q.db(), done)) == ("queued", "done")
+
+
+def test_restart_keeps_a_halt(home: Path) -> None:
+    conn = q.db()
+    failed = enqueue(conn, "false")
+    conn.execute("UPDATE jobs SET state='failed' WHERE id=?", (failed,))
     conn.commit()
     q.ctl_set(conn, "halted", "1")
-    q.cmd_requeue_failed()
-    assert state_of(q.db(), canceled) == "canceled"
-    assert q.ctl_get(q.db(), "halted", "0") == "1"  # requeueing is not looking
+    q.cmd_restart([], ["failed"])
+    assert q.ctl_get(q.db(), "halted", "0") == "1"  # restarting is not looking
 
 
 def test_front_ranks_degenerate_when_queued_outranks_running(home: Path) -> None:

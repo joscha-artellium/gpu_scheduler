@@ -200,16 +200,28 @@ pause. Cancels never count as failures.
 
 Other mechanics:
 
-- `q restart <id> ...` — SIGTERM the running job(s) and requeue **in place**
-  (same rank, retry counter untouched; not a failure). Use after a code/config
-  fix when you don't want to bounce the scheduler or disturb the rest of the
-  queue; SIGKILL after 10 s for jobs that ignore SIGTERM. `q restart --all`
-  does this for every running job — the ids are required otherwise, since this
-  throws away in-flight progress on every GPU. It only ever touches `running`
-  jobs: nothing you cancelled or that already failed is resurrected by it.
+- `q restart <id> ...` — rerun jobs, in whatever state they are:
+  - **running** (or mid-cancel) → SIGTERM, SIGKILL after 10 s, requeued **in
+    place**: same rank, `retries` untouched, not a failure. Use after a
+    code/config fix when you don't want to bounce the scheduler or disturb the
+    rest of the queue. Restarting a job whose cancel is still in flight undoes
+    the cancel.
+  - **done / failed / canceled** → appended at the **back**, `retries` reset to
+    0 (a full "one free unattended retry" budget again), exit code, gpu and
+    timestamps cleared. Listed order is preserved.
+  - queued / already restarting → no-op.
+
+  Instead of ids you can pass state selectors — `--running`, `--failed`,
+  `--canceled`, `--done` — which take every job in those states in ascending id
+  order; ids and selectors can't be mixed. `q restart --failed` is the
+  end-of-sweep tool: the drain notification hands you the failed ids, you fix
+  the root cause, one command reruns exactly the stragglers (before `q clear`,
+  which deletes them outright). Restarting never clears a pause or a halt, so
+  if the breaker tripped you need `q resume` as well before anything
+  dispatches; `q fixed` is the variant that clears it and goes to the front.
 - `q cancel <id> ...` — queued jobs go straight to `canceled`; running jobs get
   SIGTERM (then SIGKILL after 10 s). Never counted as a failure, never triggers
-  a pause. A cancel is final: use `q fixed` (failed jobs) or resubmit by hand.
+  a pause. Reversible with `q restart <id>`.
 - `q resume` — end the pause or halt **now**. It writes only the pause/halt/
   streak state and touches no job: nothing is reordered and nothing already
   marked `failed` comes back. Use it when you've looked at the failure and
@@ -217,19 +229,11 @@ Other mechanics:
   cause you fixed out of band (jobs re-read your code at spawn time, so a
   revert fixes everything still queued). `q fixed <id>` is the same thing
   *plus* moving those ids to the front and reviving them from `failed`.
-- `q requeue-failed` — every `failed` job goes back to the queue, appended at
-  the **back** in ascending id order, with **`retries` reset to 0**: a genuine
-  second chance, each job getting its "one free unattended retry" budget again.
-  `canceled` jobs are untouched. This is the end-of-sweep tool — the drain
-  notification hands you the failed ids, you fix the root cause, and one
-  command reruns exactly the stragglers. Note it does **not** clear a pause or
-  a halt, so if the breaker tripped you need `q resume` as well before anything
-  dispatches. Run it before `q clear`, which deletes failed jobs outright.
 - `q front <id> ...` / `q back <id> ...` — reorder **queued** jobs; the listed
   order is preserved. Same for the ids you pass `q fixed`.
 - `q show <id>` — prints `cwd:` / `env:` / `cmd:` for a job; `q show <id> -r`
   prints a paste-able `q add` line (prefixed with `cd <cwd> &&` when you are
-  somewhere else), which is how you resurrect a cancelled job.
+  somewhere else) — for cloning a job into an edited variant.
 - `q clear` — delete finished (`done`/`failed`/`canceled`) jobs and their log
   files; `--older-than DAYS` scopes it, `-n` shows what would go. `q clear
   --all` wipes the queue, resets the pause/halt/streak state, restarts ids at

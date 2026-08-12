@@ -19,13 +19,15 @@ Commands:
     q logs <id> [-f]                              show/follow a job's log
     q show <id> [-r]                              print cmd/env/cwd (-r: q add line)
     q cancel <id> [...]                           cancel queued/running jobs
-    q restart <id> [...] | --all                  terminate running jobs, requeue in
-                                                  place (--all: every running job)
+    q restart <id> [...] | --running --failed --canceled --done
+                                                  rerun jobs: running ones are
+                                                  terminated and requeued in place,
+                                                  finished ones go to the BACK with
+                                                  retries reset
     q front|back <id> [...]                       move queued jobs in the queue
     q fixed <id> [...]                            "I fixed it": retry at FRONT of queue
     q extend [minutes]                            extend the failure pause (default 5)
     q resume                                      end the failure pause / halt now
-    q requeue-failed                              re-enqueue all failed jobs (back)
     q clear [--older-than DAYS] [--all] [-n]      delete finished jobs + their logs
 
 QUOTING RULES
@@ -92,6 +94,10 @@ During (or after) the pause you can override the default:
   2. `q extend [minutes]` — buy more time before dispatch resumes.
   3. Do nothing — the pause expires and dispatch resumes; the default
      disposition is already in place.
+
+Later, `q restart --failed` re-enqueues every failed job at the back with
+retries reset to 0; it does not touch a pause or halt, so pair it with
+`q resume` if the breaker tripped.
 
 Pauses do not stack. A circuit breaker sits behind them: QSCHED_HALT_AFTER
 (default 12, 0 disables) *consecutive* failures — no job exiting 0 in between —
@@ -818,7 +824,7 @@ class Scheduler:
         body = f"Ran {_format_age(now - since)}. {summary}.\n"
         if failed_ids:
             ids = ", ".join(str(i) for i in failed_ids)
-            body += f"failed ids: {ids}\n  `q fixed <id>` / `q requeue-failed`\n"
+            body += f"failed ids: {ids}\n  `q fixed <id>` / `q restart --failed`\n"
         notify(f"qsched: queue drained — {summary}", body, kind="drain")
 
     def reap(self) -> None:
@@ -1147,38 +1153,63 @@ def cmd_cancel(job_ids: list[int]) -> None:
     conn.commit()
 
 
-def cmd_restart(job_ids: list[int], restart_all: bool) -> None:
-    conn = db()
-    if job_ids and restart_all:
-        raise SystemExit("`q restart --all` takes no job ids")
-    if not job_ids:
-        if not restart_all:
-            raise SystemExit(
-                "no job ids given — use `q restart --all` to restart every running job"
-            )
-        rows = conn.execute(
-            "SELECT id FROM jobs WHERE state='running' ORDER BY id"
-        ).fetchall()
-        job_ids = [int(r["id"]) for r in rows]
-        if not job_ids:
-            print("no running jobs")
+RESTART_SELECTORS = ("running", "failed", "canceled", "done")
+
+
+def restart_job(conn: sqlite3.Connection, job_id: int) -> None:
+    """Rerun one job: in place if it holds a GPU, at the back if it is finished."""
+    row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        print(f"job {job_id}: not found")
+        return
+    state = str(row["state"])
+    if state in ("running", "canceling"):
+        # conditional so a scheduler finalizing this job right now wins the race
+        claimed = conn.execute(
+            "UPDATE jobs SET state='restarting' "
+            "WHERE id=? AND state IN ('running','canceling')",
+            (job_id,),
+        ).rowcount
+        conn.commit()
+        if claimed:
+            was = " (cancel undone)" if state == "canceling" else ""
+            print(f"job {job_id}: restart requested{was} — SIGTERM, requeued in place")
             return
-    for job_id in job_ids:
-        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if row is None:
-            print(f"job {job_id}: not found")
-        elif row["state"] == "running":
-            conn.execute("UPDATE jobs SET state='restarting' WHERE id=?", (job_id,))
-            print(
-                f"job {job_id}: restart requested (scheduler will SIGTERM and requeue)"
-            )
-        elif row["state"] in ("restarting", "queued"):
-            print(f"job {job_id}: already {row['state']}, will (re)run")
-        else:
-            print(
-                f"job {job_id}: state {row['state']} — "
-                f"use `q fixed`/`q requeue-failed` instead"
-            )
+        state = str(
+            conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()[
+                "state"
+            ]
+        )
+    if state in ("queued", "restarting"):
+        print(f"job {job_id}: already {state}, will (re)run")
+        return
+    conn.execute(
+        "UPDATE jobs SET state='queued', retries=0, rank=?, gpu=NULL, pid=NULL, "
+        "started_at=NULL, finished_at=NULL, exit_code=NULL WHERE id=?",
+        (back_rank(conn), job_id),
+    )
+    print(f"job {job_id}: was {state}, requeued at back")
+
+
+def cmd_restart(job_ids: list[int], states: list[str]) -> None:
+    conn = db()
+    if job_ids and states:
+        raise SystemExit("`q restart` takes job ids or state flags, not both")
+    if not job_ids and not states:
+        flags = " ".join(f"--{state}" for state in RESTART_SELECTORS)
+        raise SystemExit(f"no job ids given — pass ids or one of: {flags}")
+    if states:
+        rows = conn.execute(
+            f"SELECT id FROM jobs WHERE state IN "
+            f"({','.join('?' * len(states))}) ORDER BY id",
+            states,
+        ).fetchall()
+        job_ids = [int(row["id"]) for row in rows]
+        if not job_ids:
+            print(f"no {'/'.join(states)} jobs")
+            return
+    for job_id in job_ids:  # listed order is preserved by the ascending back ranks
+        restart_job(conn, job_id)
     conn.commit()
 
 
@@ -1245,21 +1276,6 @@ def cmd_resume() -> None:
     conn = db()
     clear_pause(conn)
     print("dispatch resumed")
-
-
-def cmd_requeue_failed() -> None:
-    conn = db()
-    rows = conn.execute(
-        "SELECT id FROM jobs WHERE state='failed' ORDER BY id"
-    ).fetchall()
-    for row in rows:
-        conn.execute(
-            "UPDATE jobs SET state='queued', retries=0, rank=?, gpu=NULL, pid=NULL, "
-            "started_at=NULL, finished_at=NULL, exit_code=NULL WHERE id=?",
-            (back_rank(conn), row["id"]),
-        )
-    conn.commit()
-    print(f"requeued {len(rows)} failed job(s) at back")
 
 
 def _scheduler_running() -> bool:
@@ -1383,13 +1399,12 @@ def main(argv: list[str] | None = None) -> None:
     p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
     p_cancel.add_argument("job_ids", type=int, nargs="+")
 
-    p_restart = sub.add_parser(
-        "restart", help="terminate running jobs and requeue in place"
-    )
+    p_restart = sub.add_parser("restart", help="rerun running or finished jobs")
     p_restart.add_argument("job_ids", type=int, nargs="*")
-    p_restart.add_argument(
-        "--all", action="store_true", help="restart every running job"
-    )
+    for selector in RESTART_SELECTORS:
+        p_restart.add_argument(
+            f"--{selector}", action="store_true", help=f"restart every {selector} job"
+        )
 
     p_front = sub.add_parser("front", help="move queued jobs to the front")
     p_front.add_argument("job_ids", type=int, nargs="+")
@@ -1415,7 +1430,6 @@ def main(argv: list[str] | None = None) -> None:
     p_extend.add_argument("minutes", type=float, nargs="?", default=5.0)
 
     sub.add_parser("resume", help="end the failure pause / halt now")
-    sub.add_parser("requeue-failed", help="re-enqueue all failed jobs at the back")
 
     ns = parser.parse_args(before)
     match ns.cmd:
@@ -1434,7 +1448,7 @@ def main(argv: list[str] | None = None) -> None:
         case "cancel":
             cmd_cancel(ns.job_ids)
         case "restart":
-            cmd_restart(ns.job_ids, ns.all)
+            cmd_restart(ns.job_ids, [s for s in RESTART_SELECTORS if getattr(ns, s)])
         case "front":
             cmd_reorder(ns.job_ids, to_front=True)
         case "back":
@@ -1447,8 +1461,6 @@ def main(argv: list[str] | None = None) -> None:
             cmd_extend(ns.minutes)
         case "resume":
             cmd_resume()
-        case "requeue-failed":
-            cmd_requeue_failed()
 
 
 if __name__ == "__main__":
