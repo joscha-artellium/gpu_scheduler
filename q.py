@@ -134,6 +134,7 @@ from itertools import product
 from pathlib import Path
 from shutil import which
 from typing import IO, Any
+from collections import Counter
 
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
@@ -986,11 +987,6 @@ def tqdm_progress(path: Path, max_bytes: int = 4096) -> tuple[int, float] | None
     return None
 
 
-STATUS_CMD_WIDTH = 76
-STATUS_CMD_HEAD = 13  # keeps "uv run python" before the elision
-STATUS_ENV_MAX = 24
-
-
 def _elide(text: str, width: int, head: int) -> str:
     """Keep `head` leading chars plus as much of the tail as fits in `width`."""
     if len(text) <= width:
@@ -1002,6 +998,149 @@ def _elide(text: str, width: int, head: int) -> str:
 def _render_env(raw: str) -> str:
     env: dict[str, str] = json.loads(raw)
     return ",".join(f"{k}={v}" for k, v in env.items()) if env else "-"
+
+
+_KV_TOKEN = re.compile(r"^[+~]?[\w.@/-]+=")
+
+
+def _kv_split(token: str) -> tuple[str, str | None]:
+    """Split `key=value`; a bare token is its own key and carries no value."""
+    if _KV_TOKEN.match(token):
+        key, value = token.split("=", 1)
+        return key, value
+    return token, None
+
+
+def _clip_tokens(tokens: list[str], width: int, sep: str) -> str:
+    """Join in priority order, char-truncating the token that overflows.
+
+    The overflowing token is cut rather than skipped, so no lower-priority token
+    ever leapfrogs a higher-priority one, and every clipped cell fills `width`.
+    """
+    if not tokens:
+        return "-"
+    joined = sep.join(tokens)
+    if len(joined) <= width:
+        return joined
+    budget = width - 3
+    if budget <= 0:
+        return joined[:width]
+
+    kept: list[str] = []
+    used = 0
+    for token in tokens:
+        lead = len(sep) if kept else 0
+        if used + lead + len(token) <= budget:
+            kept.append(token)
+            used += lead + len(token)
+            continue
+        if (remaining := budget - used - lead) > 0:
+            kept.append(token[:remaining])
+        break
+    return f"{sep.join(kept)}..."
+
+
+def _clip(text: str, width: int) -> str:
+    return text if len(text) <= width else f"{text[: width - 3]}..."
+
+
+def _factor_common(
+    token_lists: list[list[str]], *, prefix: bool
+) -> tuple[list[str], list[list[str]]]:
+    """Pull the tokens every row shares out of `token_lists`.
+
+    Sharing means a common head (only when `prefix`, so relative order survives)
+    plus `key=value` tokens carrying the same value in every row. A key missing
+    from some row stays put — its absence is itself informative.
+    """
+    if len(token_lists) < 2:
+        return [], token_lists
+
+    common: list[str] = []
+    rest = token_lists
+    if prefix:
+        head = 0
+        first = token_lists[0]
+        shortest = min(map(len, token_lists))
+        while head < shortest and all(t[head] == first[head] for t in token_lists):
+            head += 1
+        common = first[:head]
+        rest = [tokens[head:] for tokens in token_lists]
+
+    per_row = [
+        {_kv_split(t)[0]: t for t in tokens if _kv_split(t)[1] is not None}
+        for tokens in rest
+    ]
+    shared = set(per_row[0]).intersection(*(kv.keys() for kv in per_row[1:]))
+    shared = {key for key in shared if len({kv[key] for kv in per_row}) == 1}
+    if not shared:
+        return common, rest
+
+    common += [t for t in rest[0] if _kv_split(t)[0] in shared]
+    residuals = [
+        [t for t in tokens if _kv_split(t)[0] not in shared] for tokens in rest
+    ]
+    return common, residuals
+
+
+def _priority_sort(token_lists: list[list[str]]) -> list[list[str]]:
+    """Rarest key first, then rarest value — frequency counted across rows."""
+    key_rows: Counter[str] = Counter()
+    token_rows: Counter[str] = Counter()
+    for tokens in token_lists:
+        key_rows.update({_kv_split(token)[0] for token in tokens})
+        token_rows.update(set(tokens))
+    return [
+        sorted(tokens, key=lambda t: (key_rows[_kv_split(t)[0]], token_rows[t]))
+        for tokens in token_lists
+    ]
+
+
+def _factor_key(token_lists: list[list[str]]) -> tuple[str | None, list[list[str]]]:
+    """Strip the name of the one key that wastes the most width, values left bare.
+
+    Exactly one key is ever stripped, so a token without `=` is unambiguously
+    that key's value and a row lacking the key simply has no bare token. Keys
+    whose values would themselves parse as `k=v` are skipped.
+    """
+    savings: Counter[str] = Counter()
+    blocked: set[str] = set()
+    for tokens in token_lists:
+        for token in tokens:
+            key, value = _kv_split(token)
+            if value is None:
+                continue
+            if not value or "=" in value:
+                blocked.add(key)
+            savings[key] += len(key) + 1
+
+    # savings > len(key) + 1 means the key occurs in at least two rows.
+    candidates = [
+        key
+        for key, saved in savings.items()
+        if key not in blocked and saved > len(key) + 1
+    ]
+    if not candidates:
+        return None, token_lists
+
+    best = min(candidates, key=lambda k: (-savings[k], k))
+    stripped = [
+        [
+            value
+            if (key, value) == (best, _kv_split(t)[1]) and value is not None
+            else t
+            for t in tokens
+            for key, value in [_kv_split(t)]
+        ]
+        for tokens in token_lists
+    ]
+    return best, stripped
+
+
+STATUS_CMD_WIDTH = 76  # floor; COMMAND absorbs width ENV does not use
+STATUS_ENV_MAX = 24
+_STATUS_FIXED_WIDTH = 43  # ID through the two spaces after GPU
+STATUS_TABLE_WIDTH = _STATUS_FIXED_WIDTH + STATUS_ENV_MAX + 2 + STATUS_CMD_WIDTH
 
 
 def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str:
@@ -1029,13 +1168,40 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
     if not rows:
         lines.append("queue is empty")
         return "\n".join(lines)
-    envs = {int(row["id"]): _render_env(row["env"]) for row in rows}
-    env_width = min(max(3, *map(len, envs.values())), STATUS_ENV_MAX)
+
+    common_env, env_rest = _factor_common(
+        [[f"{k}={v}" for k, v in json.loads(row["env"]).items()] for row in rows],
+        prefix=False,
+    )
+    common_cmd, cmd_rest = _factor_common(
+        [json.loads(row["argv"]) for row in rows], prefix=True
+    )
+    bare_key, env_rest = _factor_key(_priority_sort(env_rest))
+    cmd_rest = [
+        [shlex.quote(token) for token in tokens] for tokens in _priority_sort(cmd_rest)
+    ]
+
+    show_env = any(env_rest)
+    env_width = (
+        min(max(3, *(len(",".join(t)) for t in env_rest)), STATUS_ENV_MAX)
+        if show_env
+        else 0
+    )
+    env_span = env_width + 2 if show_env else 0
+    cmd_width = STATUS_TABLE_WIDTH - _STATUS_FIXED_WIDTH - env_span
+
+    env_common = [*common_env, f"{bare_key}=*"] if bare_key else list(common_env)
+    if common_cmd:
+        lines.append(_clip(f"common cmd: {shlex.join(common_cmd)}", STATUS_TABLE_WIDTH))
+    if env_common:
+        lines.append(_clip(f"common env: {','.join(env_common)}", STATUS_TABLE_WIDTH))
+
+    env_header = f"{'ENV':<{env_width}}  " if show_env else ""
     lines.append(
         f"{'ID':>5} {'STATE':<9} {'TRY':>3} {'TIME':>6} {'ETA':>10} {'GPU':>3}  "
-        f"{'ENV':<{env_width}}  COMMAND"
+        f"{env_header}COMMAND"
     )
-    for row in rows:
+    for index, row in enumerate(rows):
         live = row["state"] in ("running", "canceling")
         if row["started_at"] and live:
             runtime = _format_age(now - row["started_at"])
@@ -1049,13 +1215,16 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             if progress is not None:
                 percent, remaining = progress
                 eta = f"{percent}% {_format_age(remaining)}"
-        argv: list[str] = json.loads(row["argv"])
-        command = _elide(shlex.join(argv), STATUS_CMD_WIDTH, STATUS_CMD_HEAD)
-        env = _elide(envs[int(row["id"])], env_width, env_width // 2)
+        command = _clip_tokens(cmd_rest[index], cmd_width, " ")
+        env = (
+            f"{_clip_tokens(env_rest[index], env_width, ','):<{env_width}}  "
+            if show_env
+            else ""
+        )
         gpu = row["gpu"] if row["gpu"] is not None else "-"
         lines.append(
             f"{row['id']:>5} {row['state']:<9} {row['retries']:>3} "
-            f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env:<{env_width}}  {command}"
+            f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env}{command}"
         )
     return "\n".join(lines)
 
