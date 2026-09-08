@@ -134,8 +134,7 @@ from itertools import product
 from pathlib import Path
 from shutil import which
 from typing import IO, Any
-from collections import Counter
-
+from collections import Counter, deque
 
 PAUSE_SECONDS = float(os.environ.get("QSCHED_PAUSE_SECONDS", "180"))
 HALT_AFTER = int(os.environ.get("QSCHED_HALT_AFTER", "12"))  # 0 disables halting
@@ -1163,8 +1162,21 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
         lines.append(summary)
     rows = conn.execute("SELECT * FROM jobs ORDER BY rank, id").fetchall()
     if not show_all:
-        finished = [r for r in rows if r["state"] not in ACTIVE_STATES]
-        rows = finished[-5:] + [r for r in rows if r["state"] in ACTIVE_STATES]
+        recent_finished = deque(maxlen=6)
+        active = []
+        for r in rows:
+            if r["state"] in ACTIVE_STATES:
+                active.append(r)
+            else:
+                recent_finished.append(r)
+        finished = list(recent_finished)
+        if len(active) == 0:
+            pass
+        elif len(active) < 6:
+            finished = finished[-3:]
+        else:
+            finished.clear()
+        rows = finished + active
     if not rows:
         lines.append("queue is empty")
         return "\n".join(lines)
