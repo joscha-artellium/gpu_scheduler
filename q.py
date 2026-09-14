@@ -631,6 +631,7 @@ class Scheduler:
         job_id = int(row["id"])
         argv: list[str] = json.loads(row["argv"])
         job_env: dict[str, str] = json.loads(row["env"])
+        job_env["NOTE"] = f"job{job_id}"
         logs = log_dir()
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / f"{job_id}.log"
@@ -986,19 +987,6 @@ def tqdm_progress(path: Path, max_bytes: int = 4096) -> tuple[int, float] | None
     return None
 
 
-def _elide(text: str, width: int, head: int) -> str:
-    """Keep `head` leading chars plus as much of the tail as fits in `width`."""
-    if len(text) <= width:
-        return text
-    tail = width - head - 3
-    return f"{text[:head]}...{text[-tail:]}" if tail > 0 else text[:width]
-
-
-def _render_env(raw: str) -> str:
-    env: dict[str, str] = json.loads(raw)
-    return ",".join(f"{k}={v}" for k, v in env.items()) if env else "-"
-
-
 _KV_TOKEN = re.compile(r"^[+~]?[\w.@/-]+=")
 
 
@@ -1314,8 +1302,15 @@ def cmd_logs(job_id: int, follow: bool) -> None:
         out.flush()
 
 
-def cmd_cancel(job_ids: list[int]) -> None:
+def cmd_cancel(job_ids: list[int], *, queued: bool = False) -> None:
     conn = db()
+    if queued:
+        if job_ids:
+            raise SystemExit("`q cancel` takes job ids or state, not both")
+        rows = conn.execute(
+            f"SELECT id FROM jobs WHERE state='queued' ORDER BY id",
+        ).fetchall()
+        job_ids = [int(row["id"]) for row in rows]
     for job_id in job_ids:
         row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
@@ -1561,7 +1556,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p_run = sub.add_parser("run", help="start the scheduler (foreground)")
     p_run.add_argument(
-        "--gpus", default="0,2,1", help="GPU ids, in dispatch preference order"
+        "--gpus", default="0,1,2", help="GPU ids, in dispatch preference order"
     )
 
     p_status = sub.add_parser("status", help="show the queue")
@@ -1578,7 +1573,8 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
-    p_cancel.add_argument("job_ids", type=int, nargs="+")
+    p_cancel.add_argument("job_ids", type=int, nargs="*")
+    p_cancel.add_argument("--queued", action="store_true")
 
     p_restart = sub.add_parser("restart", help="rerun running or finished jobs")
     p_restart.add_argument("job_ids", type=int, nargs="*")
@@ -1627,7 +1623,7 @@ def main(argv: list[str] | None = None) -> None:
         case "logs":
             cmd_logs(ns.job_id, ns.follow)
         case "cancel":
-            cmd_cancel(ns.job_ids)
+            cmd_cancel(ns.job_ids, queued=ns.queued)
         case "restart":
             cmd_restart(ns.job_ids, [s for s in RESTART_SELECTORS if getattr(ns, s)])
         case "front":
