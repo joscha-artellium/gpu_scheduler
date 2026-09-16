@@ -971,7 +971,7 @@ def _parse_hms(value: str) -> float:
     return seconds
 
 
-def tqdm_progress(path: Path, max_bytes: int = 4096) -> tuple[int, float] | None:
+def tqdm_progress(path: Path, max_bytes: int = 512) -> tuple[int, float] | None:
     """(percent, seconds remaining) from the last complete tqdm bar in the tail."""
     try:
         with path.open("rb") as handle:
