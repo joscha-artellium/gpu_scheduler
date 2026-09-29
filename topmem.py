@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import glob
 import os
+import re
 import sys
 
 # --- Color Configuration (Standard Library Only) ---
@@ -20,6 +21,14 @@ CYAN = "\033[36m" if USE_COLOR else ""
 BOLD_CYAN = "\033[1;36m" if USE_COLOR else ""
 BOLD_YELLOW = "\033[1;33m" if USE_COLOR else ""
 BOLD_WHITE = "\033[1;37m" if USE_COLOR else ""
+
+# --- Memory summary layout ---
+KIB_PER_GIB = 1024 * 1024
+BAR_WIDTH = 40
+LABEL_WIDTH = 6
+WARN_FRACTION = 0.60
+CRITICAL_FRACTION = 0.85
+ANSI_ESCAPE = re.compile(r"\033\[[0-9;]*m")
 
 # Processes that act as containers/supervisors for separate user workloads
 BOUNDARIES = {
@@ -72,7 +81,7 @@ BOUNDARIES = {
 
 
 def is_boundary(pdata):
-    """Check if a process is a shell, terminal emulator, desktop host, or system supervisor."""
+    """Check if a process is a shell, terminal emulator, etc."""
     cmd = pdata.get("cmdline", "").lower()
     name = pdata.get("name", "").lower()
 
@@ -88,17 +97,97 @@ def is_boundary(pdata):
     return False
 
 
-def get_meminfo():
-    info = {}
-    try:
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    info[parts[0].strip()] = int(parts[1].strip().split()[0])
-    except Exception:
-        pass
+def get_meminfo() -> dict[str, int]:
+    """Parse /proc/meminfo into {field: value}. Values are kB or count."""
+    info: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            info[key] = int(rest.split()[0])
     return info
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI_ESCAPE.sub("", text))
+
+
+def gib(kib: int) -> float:
+    return kib / KIB_PER_GIB
+
+
+def utilization_color(fraction: float) -> str:
+    if fraction >= CRITICAL_FRACTION:
+        return RED
+    if fraction >= WARN_FRACTION:
+        return YELLOW
+    return GREEN
+
+
+def render_bar(used: int, reclaimable: int, total: int, used_color: str) -> str:
+    # Cumulative rounding so the three segments always sum to BAR_WIDTH exactly.
+    used_cells = round(used / total * BAR_WIDTH)
+    through_reclaimable = round((used + reclaimable) / total * BAR_WIDTH)
+    reclaimable_cells = through_reclaimable - used_cells
+    free_cells = BAR_WIDTH - through_reclaimable
+    return (
+        f"[{used_color}{'█' * used_cells}{RESET}"
+        f"{CYAN}{'▒' * reclaimable_cells}{RESET}"
+        f"{DIM}{'░' * free_cells}{RESET}]"
+    )
+
+
+def usage_line(label: str, bar: str, used: int, total: int, color: str) -> str:
+    return (
+        f"{label:<{LABEL_WIDTH}}{bar}  {gib(used):5.1f} / {gib(total):5.1f} GB "
+        f"{color}{used / total:>5.0%}{RESET}"
+    )
+
+
+def print_memory_summary(meminfo: dict[str, int]) -> None:
+    total = meminfo["MemTotal"]
+    free = meminfo["MemFree"]
+    # Pre-3.14 kernels lack MemAvailable; fall back to "used = total - free".
+    available = meminfo.get("MemAvailable", free)
+    # Clamped: on tiny systems MemAvailable can dip below MemFree (watermark reserve).
+    reclaimable = max(0, available - free)
+    used = total - free - reclaimable
+
+    apps = meminfo.get("AnonPages", 0)
+    shared = meminfo.get("Shmem", 0)
+    kernel_other = max(0, used - apps - shared)
+
+    ram_color = utilization_color(used / total)
+    indent = " " * LABEL_WIDTH
+    ram_bar = render_bar(used, reclaimable, total, ram_color)
+    lines = [
+        usage_line("RAM", ram_bar, used, total, ram_color),
+        (
+            f"{indent}used {ram_color}{gib(used):.1f}{RESET} · "
+            f"cache {CYAN}{gib(reclaimable):.1f}{RESET} · "
+            f"free {GREEN}{gib(free):.1f}{RESET}"
+            f"   available {GREEN}{gib(available):.1f}{RESET}"
+        ),
+        (
+            f"{indent}{DIM}of used:{RESET} apps {gib(apps):.1f} · "
+            f"shared {gib(shared):.1f} · kernel/other {gib(kernel_other):.1f}"
+        ),
+    ]
+
+    swap_total = meminfo.get("SwapTotal", 0)
+    if swap_total == 0:
+        lines.append(f"{'Swap':<{LABEL_WIDTH}}none")
+    else:
+        swap_used = swap_total - meminfo.get("SwapFree", 0)
+        swap_color = utilization_color(swap_used / swap_total)
+        swap_bar = render_bar(swap_used, 0, swap_total, swap_color)
+        lines.append(usage_line("Swap", swap_bar, swap_used, swap_total, swap_color))
+
+    width = max(visible_len(line) for line in lines)
+    print(f"{DIM}{'=' * width}{RESET}")
+    print(f"{BOLD_CYAN}MEMORY UTILIZATION{RESET}")
+    print(f"{DIM}{'-' * width}{RESET}")
+    for line in lines:
+        print(line)
 
 
 def find_ancestor(pid, raw_procs):
@@ -122,7 +211,7 @@ def find_ancestor(pid, raw_procs):
 def print_table(
     title, proc_list, top_n, pid_w=7, mem_w=8, cmd_max_len=75, kb_to_gb=1024 * 1024
 ):
-    print(f"\n{BOLD_CYAN}{title}{RESET}")
+    print(f"{BOLD_CYAN}{title}{RESET}")
 
     # Headers for width calculation
     fmt_hdr = (
@@ -194,8 +283,6 @@ def main():
     KB_TO_GB = 1024 * 1024
 
     raw_procs = {}
-    tot_rss_all = 0
-    tot_swap_all = 0
 
     # 1. Gather process data
     for p in glob.glob("/proc/[0-9]*"):
@@ -232,8 +319,6 @@ def main():
                 "cmdline": cmdline,
             }
 
-            tot_rss_all += rss
-            tot_swap_all += swap
         except Exception:
             continue
 
@@ -302,6 +387,7 @@ def main():
         cmd_max_len=CMDLINE_MAX_LEN,
         kb_to_gb=KB_TO_GB,
     )
+    print()
     print_table(
         "TOP PROCESS TREES (AGGREGATED)",
         ancestor_procs,
@@ -310,79 +396,10 @@ def main():
         kb_to_gb=KB_TO_GB,
     )
 
-    # 5. System Reconciliation Summary
-    m = get_meminfo()
-    mem_total = m.get("MemTotal", 0) / KB_TO_GB
-    mem_free = m.get("MemFree", 0) / KB_TO_GB
-    mem_avail = m.get("MemAvailable", 0) / KB_TO_GB
-    ram_used = mem_total - mem_avail if "MemAvailable" in m else (mem_total - mem_free)
-
-    swap_total = m.get("SwapTotal", 0) / KB_TO_GB
-    swap_free = m.get("SwapFree", 0) / KB_TO_GB
-    swap_used = swap_total - swap_free
-
-    proc_ram_gb = tot_rss_all / KB_TO_GB
-    proc_swap_gb = tot_swap_all / KB_TO_GB
-
-    anon_pages = m.get("AnonPages", 0) / KB_TO_GB
-    cached_gb = (m.get("Cached", 0) + m.get("Buffers", 0)) / KB_TO_GB
-    kernel_driver_gb = max(0.0, mem_total - anon_pages - cached_gb - mem_free)
-    other_swap_gb = max(0.0, swap_used - proc_swap_gb)
-
-    # Plain strings for length measurement
-    ram1 = f"RAM Used: {ram_used:.2f}/{mem_total:.2f} GB (Avail: {mem_avail:.2f} GB, Free: {mem_free:.2f} GB)"
-    ram2 = f"RAM (RSS): {proc_ram_gb:.2f} GB (incl. shared)"
-    ram_w = len(ram1)
-
-    p_line1 = f"  System Totals : {ram1:<{ram_w}} | Swap Used: {swap_used:.2f}/{swap_total:.2f} GB (Free: {swap_free:.2f} GB)"
-    p_line2 = (
-        f"  Process Sums  : {ram2:<{ram_w}} | Swap (VmSwap): {proc_swap_gb:.2f} GB"
-    )
-
-    lbl_ram = f"RAM  ({mem_total:.2f} GB)"
-    lbl_swap = f"SWAP ({swap_total:.2f} GB)"
-    lbl_w = max(len(lbl_ram), len(lbl_swap))
-
-    p_line_ram = f"  {lbl_ram:<{lbl_w}} : Heap (Anon): {anon_pages:.2f} GB | Cache: {cached_gb:.2f} GB | Kernel/Drivers: {kernel_driver_gb:.2f} GB | Free: {mem_free:.2f} GB"
-    p_line_swap = f"  {lbl_swap:<{lbl_w}} : Process Swap: {proc_swap_gb:.2f} GB | Other/IPC Swap: {other_swap_gb:.2f} GB | Free: {swap_free:.2f} GB"
-
-    summary_width = max(len(s) for s in [p_line1, p_line2, p_line_ram, p_line_swap])
-
-    # Colored strings for output
-    sep = f"{DIM}|{RESET}"
-    c_ram1 = f"RAM Used: {YELLOW}{ram_used:.2f}{RESET}/{mem_total:.2f} GB (Avail: {GREEN}{mem_avail:.2f}{RESET} GB, Free: {GREEN}{mem_free:.2f}{RESET} GB)"
-    c_ram2 = f"RAM (RSS): {GREEN}{proc_ram_gb:.2f}{RESET} GB (incl. shared)"
-    spaces_ram2 = " " * (ram_w - len(ram2))
-
-    c_line1 = f"  {BOLD}System Totals{RESET} : {c_ram1} {sep} Swap Used: {MAGENTA}{swap_used:.2f}{RESET}/{swap_total:.2f} GB (Free: {GREEN}{swap_free:.2f}{RESET} GB)"
-    c_line2 = f"  {BOLD}Process Sums {RESET} : {c_ram2}{spaces_ram2} {sep} Swap (VmSwap): {MAGENTA}{proc_swap_gb:.2f}{RESET} GB"
-
-    lbl_ram_pad = f"{lbl_ram:<{lbl_w}}"
-    lbl_swap_pad = f"{lbl_swap:<{lbl_w}}"
-
-    c_line_ram = (
-        f"  {BOLD_CYAN}{lbl_ram_pad}{RESET} : "
-        f"Heap (Anon): {YELLOW}{anon_pages:.2f}{RESET} GB {sep} "
-        f"Cache: {CYAN}{cached_gb:.2f}{RESET} GB {sep} "
-        f"Kernel/Drivers: {BLUE}{kernel_driver_gb:.2f}{RESET} GB {sep} "
-        f"Free: {GREEN}{mem_free:.2f}{RESET} GB"
-    )
-
-    c_line_swap = (
-        f"  {BOLD_CYAN}{lbl_swap_pad}{RESET} : "
-        f"Process Swap: {MAGENTA}{proc_swap_gb:.2f}{RESET} GB {sep} "
-        f"Other/IPC Swap: {YELLOW}{other_swap_gb:.2f}{RESET} GB {sep} "
-        f"Free: {GREEN}{swap_free:.2f}{RESET} GB"
-    )
-
-    print("\n" + f"{DIM}{'=' * summary_width}{RESET}")
-    print(f"{BOLD_CYAN}SYSTEM RECONCILIATION SUMMARY{RESET}")
-    print(f"{DIM}{'-' * summary_width}{RESET}")
-    print(c_line1)
-    print(c_line2)
-    print(f"{DIM}{'-' * summary_width}{RESET}")
-    print(c_line_ram)
-    print(c_line_swap)
+    # 5. Memory summary
+    print()
+    print_memory_summary(get_meminfo())
+    print()
 
 
 if __name__ == "__main__":
