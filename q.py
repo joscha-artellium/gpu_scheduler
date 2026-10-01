@@ -1078,7 +1078,10 @@ def _priority_sort(token_lists: list[list[str]]) -> list[list[str]]:
         key_rows.update({_kv_split(token)[0] for token in tokens})
         token_rows.update(set(tokens))
     return [
-        sorted(tokens, key=lambda t: (key_rows[_kv_split(t)[0]], token_rows[t]))
+        sorted(
+            tokens,
+            key=lambda t: (len(t) > 50, key_rows[_kv_split(t)[0]], token_rows[t]),
+        )
         for tokens in token_lists
     ]
 
