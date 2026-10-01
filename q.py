@@ -1167,12 +1167,10 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             else:
                 recent_finished.append(r)
         finished = list(recent_finished)
-        if len(active) == 0:
-            pass
-        elif len(active) < 6:
-            finished = finished[-3:]
-        else:
+        if len(active) >= 8:
             finished.clear()
+        elif len(active) > 0:
+            finished = finished[-3:]
         rows = finished + active
     if not rows:
         lines.append("queue is empty")
