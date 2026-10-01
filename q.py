@@ -447,16 +447,20 @@ def report_probes(results: list[ProbeResult]) -> None:
             print(f"   --- output tail ---\n{result.output}", file=sys.stderr)
 
 
-def prompt_yes(question: str, timeout: float) -> bool:
-    """Ask on stdin; a closed stdin or an expired timeout both mean yes."""
-    print(f"{question} [Y/n] (yes in {timeout:.0f}s): ", end="", flush=True)
+def prompt_confirm(question: str, timeout: float, *, default: bool) -> bool:
+    """Ask on stdin; empty input, a closed stdin or a timeout mean `default`."""
+    hint = "[Y/n]" if default else "[y/N]"
+    default_word = "yes" if default else "no"
+    print(f"{question} {hint} ({default_word} in {timeout:.0f}s): ", end="", flush=True)
     ready, _, _ = select.select([sys.stdin], [], [], timeout)
     if not ready:
-        print("\n-- timed out, proceeding")
-        return True
-    answer = sys.stdin.readline()
+        print(f"\n-- timed out, defaulting to {default_word}")
+        return default
+    answer = sys.stdin.readline().strip().lower()
     print()
-    return answer.strip().lower() in ("", "y", "yes")
+    if not answer:
+        return default
+    return answer in ("y", "yes")
 
 
 def validated_combos(
@@ -472,8 +476,10 @@ def validated_combos(
         raise SystemExit(f"all {len(combos)} job(s) rejected — nothing enqueued")
     if on_reject == "abort":
         raise SystemExit(f"{len(combos) - len(survivors)} rejected — nothing enqueued")
-    if on_reject == "ask" and not prompt_yes(
-        f"enqueue the {len(survivors)} job(s) that passed?", VALIDATE_PROMPT_SECONDS
+    if on_reject == "ask" and not prompt_confirm(
+        f"enqueue the {len(survivors)} job(s) that passed?",
+        VALIDATE_PROMPT_SECONDS,
+        default=False,
     ):
         raise SystemExit("nothing enqueued")
     return survivors
