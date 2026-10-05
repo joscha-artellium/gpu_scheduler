@@ -10,26 +10,38 @@ dispatches queued jobs onto free GPUs (one GPU per job, exact bookkeeping, no
 nvidia-smi heuristics). The CLI works whether or not the scheduler is running.
 
 Commands:
-    q add   [--env K=V ...] [--validate] -- <cmd ...>  enqueue one job
-    q sweep [--env K=V ...] [-n] [--validate] -- <cmd ...>
+    q add   [--env K=V ...] [--backlog] [--validate] -- <cmd ...>
+                                                  enqueue one job
+    q sweep [--env K=V ...] [--backlog] [-n] [--validate] -- <cmd ...>
                                                   expand hydra-style sweeps,
                                                   enqueue one job per combo
     q run   [--gpus 0,2,1]                        start the scheduler
     q gpus  [0,1,2]                               show or update active GPUs
-    q status [--all]                              show the queue
-    q logs <id> [-f]                              show/follow a job's log
+    q status [--all | --backlog]                  show the queue (or the backlog)
+    q logs <id> [-n N|all] [-f]                   show/follow a job's log (-f starts
+                                                  at the last 50 lines)
     q show <id> [-r]                              print cmd/env/cwd (-r: q add line)
-    q cancel <id> [...]                           cancel queued/running jobs
+    q cancel <id> [...] | --queued                cancel queued/backlog/running jobs
     q restart <id> [...] | --running --failed --canceled --done
                                                   rerun jobs: running ones are
                                                   terminated and requeued in place,
                                                   finished ones go to the BACK with
                                                   retries reset
     q front|back <id> [...]                       move queued jobs in the queue
+    q backlog <id> [...]                          park queued jobs in the backlog
+    q release <id> [...] | --all                  backlog jobs -> BACK of the queue
     q fixed <id> [...]                            "I fixed it": retry at FRONT of queue
     q extend [minutes]                            extend the failure pause (default 5)
     q resume                                      end the failure pause / halt now
     q clear [--older-than DAYS] [--all] [-n]      delete finished jobs + their logs
+
+Wherever a command takes job ids, `A-B` stands for every existing job from A
+through B (inclusive): `q cancel 120-160 175`. `q sweep` prints the ids it
+enqueued in that form.
+
+`q logs -n N` prints only the last N lines and `-n all` the whole log; a tqdm
+`\r` redraw counts as a line break. Plain `q logs` prints everything, while
+`-f` starts at the last 50 lines unless -n says otherwise.
 
 QUOTING RULES
 =============
@@ -66,7 +78,7 @@ so a cooperating target can validate its config and fail fast. A probe passes
 only if it exits VALIDATE_OK_CODE (80); exiting 0 means the target ignored the
 variable and ran for real. Probes run in parallel, each under
 QSCHED_VALIDATE_TIMEOUT seconds. When some are rejected,
---on-reject decides: ask (default, yes after 100 s), skip (enqueue the rest),
+--on-reject decides: ask (default, no after 60 s), skip (enqueue the rest),
 or abort (enqueue nothing).
 
 Environment variables go through --env (repeatable), never shell prefixes:
@@ -106,18 +118,40 @@ make the pause indefinite (halt) until `q fixed`/`q resume`/`q extend`. Any
 successful job resets the streak. Cancels never count as failures.
 
 When the last running job finishes and nothing is queued, the scheduler sends
-one "queue drained" notification with the tally for that batch.
+one "queue drained" notification with the tally for that batch and the size of
+the backlog, if any.
 
 On scheduler shutdown (Ctrl-C / SIGTERM / SIGHUP) running jobs are terminated
 and requeued in place — with an idempotent framework a rerun skips completed
 work. On startup, stale `running` rows are requeued after killing verified
 orphans.
+
+BACKLOG
+=======
+`backlog` parks low-priority jobs (a weekend sweep, say): the scheduler never
+dispatches them and they do not count as pending, so the queue can drain — and
+notify, with the backlog size — while they wait. They show up in the status
+tally and under `q status --backlog` only, not in the default view or --all.
+`q release <id> [...]` / `q release --all` moves them to the BACK of the queue
+in the order listed (rank order for --all). `q cancel <id>` works on them;
+`q cancel --queued`, `q clear` (without --all) and `q restart --<state>` leave
+them alone, and `q restart <id>` points you at `q release`.
+
+DRAIN ESTIMATE
+==============
+Once at least 3 jobs have finished `done`, the status tally ends with
+`drain ~6.2h`. Every queued job (not the backlog) is assumed to take the median
+wall time of the 20 most recent done jobs and goes on whichever GPU frees
+first; running jobs count down from their tqdm ETA, else from that median. The
+error grows with the spread of job runtimes; pauses, halts and failure retries
+are not modeled.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import heapq
 import json
 import os
 import re
@@ -125,6 +159,7 @@ import select
 import shlex
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -200,7 +235,8 @@ def notify_hook() -> Path:
 ACTIVE_STATES = ("queued", "running", "canceling", "restarting")
 DISPATCHED_STATES = ("running", "canceling", "restarting")  # active, holding a GPU
 TERMINAL_STATES = ("done", "failed", "canceled")
-STATE_ORDER = (*ACTIVE_STATES, *TERMINAL_STATES)
+# `backlog` is parked: never dispatched, and not "pending" for the drain check
+STATE_ORDER = (*ACTIVE_STATES, "backlog", *TERMINAL_STATES)
 
 
 # --------------------------------------------------------------------------- db
@@ -275,6 +311,47 @@ def ctl_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------- job id selectors
+
+type IdSpec = tuple[int, int]  # inclusive bounds; first == last for a plain id
+
+
+def parse_id_spec(token: str) -> IdSpec:
+    """`7` -> (7, 7), `120-160` -> (120, 160)."""
+    low, dash, high = token.partition("-")
+    try:
+        first = int(low)
+        last = int(high) if dash else first
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a job id or a range like 120-160, got {token!r}"
+        ) from None
+    if last < first:
+        raise argparse.ArgumentTypeError(f"empty range: {token!r}")
+    return first, last
+
+
+def resolve_ids(specs: list[IdSpec]) -> list[int]:
+    """Expand specs into job ids, in the order given and without repeats.
+
+    A plain id is kept even when no such job exists (the command reports it); a
+    range expands to the jobs that exist within it.
+    """
+    conn = db() if any(first != last for first, last in specs) else None
+    ids: dict[int, None] = {}
+    for first, last in specs:
+        if conn is None or first == last:
+            ids[first] = None
+            continue
+        found = conn.execute(
+            "SELECT id FROM jobs WHERE id BETWEEN ? AND ? ORDER BY id", (first, last)
+        ).fetchall()
+        if not found:
+            print(f"no jobs in range {first}-{last}")
+        ids.update(dict.fromkeys(int(row["id"]) for row in found))
+    return list(ids)
+
+
 # ----------------------------------------------------------------- sweep expansion
 
 OVERRIDE_RE = re.compile(r"^(?P<key>[+~]{0,2}[\w.@/:]+)=(?P<value>.*)$", re.S)
@@ -334,14 +411,34 @@ def parse_env_pairs(pairs: list[str]) -> dict[str, str]:
     return env
 
 
-def insert_job(conn: sqlite3.Connection, argv: list[str], env: dict[str, str]) -> int:
-    cur = conn.execute(
-        "INSERT INTO jobs(argv, env, cwd, submitted_at, rank) "
-        "VALUES(?,?,?,?, (SELECT COALESCE(MAX(rank),0)+1 FROM jobs))",
-        (json.dumps(argv), json.dumps(env), os.getcwd(), time.time()),
-    )
-    conn.commit()
-    return int(cur.lastrowid or 0)
+def insert_jobs(
+    conn: sqlite3.Connection,
+    argvs: list[list[str]],
+    env: dict[str, str],
+    state: str = "queued",
+) -> list[int]:
+    """Insert every job in ONE transaction.
+
+    The write lock is held from the first INSERT, so the ids come out contiguous
+    (`q cancel 120-160` can address a sweep) and an interrupted sweep leaves
+    nothing behind.
+    """
+    cwd, env_json, now = os.getcwd(), json.dumps(env), time.time()
+    ids: list[int] = []
+    with conn:
+        for argv in argvs:
+            cur = conn.execute(
+                "INSERT INTO jobs(argv, env, cwd, state, submitted_at, rank) "
+                "VALUES(?,?,?,?,?, (SELECT COALESCE(MAX(rank),0)+1 FROM jobs))",
+                (json.dumps(argv), env_json, cwd, state, now),
+            )
+            ids.append(int(cur.lastrowid or 0))
+    return ids
+
+
+def format_id_range(ids: list[int]) -> str:
+    """`120-131` for a contiguous batch, `7` for a single id."""
+    return str(ids[0]) if len(ids) == 1 else f"{ids[0]}-{ids[-1]}"
 
 
 def resolve_failure_default(
@@ -494,6 +591,8 @@ def cmd_add(
     command: list[str],
     validate: bool = False,
     on_reject: str = "ask",
+    *,
+    backlog: bool = False,
 ) -> None:
     if not command:
         raise SystemExit("no command given (usage: q add [--env K=V] -- cmd ...)")
@@ -501,8 +600,9 @@ def cmd_add(
     if validate:
         validated_combos([command], env, on_reject)
     conn = db()
-    job_id = insert_job(conn, command, env)
-    print(f"enqueued job {job_id}: {shlex.join(command)}")
+    (job_id,) = insert_jobs(conn, [command], env, "backlog" if backlog else "queued")
+    parked = " to backlog" if backlog else ""
+    print(f"enqueued job {job_id}{parked}: {shlex.join(command)}")
 
 
 def cmd_sweep(
@@ -511,6 +611,8 @@ def cmd_sweep(
     dry_run: bool,
     validate: bool = False,
     on_reject: str = "ask",
+    *,
+    backlog: bool = False,
 ) -> None:
     if not command:
         raise SystemExit(
@@ -535,8 +637,9 @@ def cmd_sweep(
     if validate:
         combos = validated_combos(combos, env, on_reject)
     conn = db()
-    ids = [insert_job(conn, combo, env) for combo in combos]
-    print(f"enqueued {len(ids)} job(s): ids {ids[0]}..{ids[-1]}")
+    ids = insert_jobs(conn, combos, env, "backlog" if backlog else "queued")
+    parked = " to backlog" if backlog else ""
+    print(f"enqueued {len(ids)} job(s){parked}: ids {format_id_range(ids)}")
 
 
 # ------------------------------------------------------------------ notifications
@@ -642,14 +745,31 @@ class Scheduler:
         self.conn.commit()
 
     # -- dispatch -----------------------------------------------------------
-    def spawn(self, row: sqlite3.Row, gpu: int) -> None:
+    def claim(self, job_id: int, gpu: int, log_path: Path) -> bool:
+        """Take a queued job for `gpu`; False if a CLI command moved it first.
+
+        Conditional on the state, so a concurrent `q cancel` or `q backlog` is
+        never overwritten by the dispatch that read the row a moment earlier.
+        """
+        claimed = self.conn.execute(
+            "UPDATE jobs SET state='running', gpu=?, started_at=?, log_path=? "
+            "WHERE id=? AND state='queued'",
+            (gpu, time.time(), str(log_path), job_id),
+        ).rowcount
+        self.conn.commit()
+        return bool(claimed)
+
+    def spawn(self, row: sqlite3.Row, gpu: int) -> bool:
+        """Start a queued job on `gpu`; False if it was no longer queued."""
         job_id = int(row["id"])
-        argv: list[str] = json.loads(row["argv"])
-        job_env: dict[str, str] = json.loads(row["env"])
-        job_env["NOTE"] = f"job{job_id}"
         logs = log_dir()
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / f"{job_id}.log"
+        if not self.claim(job_id, gpu, log_path):
+            return False
+        argv: list[str] = json.loads(row["argv"])
+        job_env: dict[str, str] = json.loads(row["env"])
+        job_env["NOTE"] = f"job{job_id}"
         log_file: IO[bytes] = open(log_path, "ab", buffering=0)
         env = {**base_env(), **job_env, "CUDA_VISIBLE_DEVICES": str(gpu)}
         header = f"== qsched job {job_id} on gpu {gpu} :: {shlex.join(argv)}\n"
@@ -666,24 +786,16 @@ class Scheduler:
         except OSError as exc:
             log_file.write(f"== spawn failed: {exc}\n".encode())
             log_file.close()
-            self.conn.execute(
-                "UPDATE jobs "
-                "SET state='running', gpu=?, started_at=?, log_path=? WHERE id=?",
-                (gpu, time.time(), str(log_path), job_id),
-            )
-            self.conn.commit()
             self.finalize(job_id, exit_code=127, log_path=log_path)
-            return
-        self.conn.execute(
-            "UPDATE jobs "
-            "SET state='running', gpu=?, pid=?, started_at=?, log_path=? WHERE id=?",
-            (gpu, proc.pid, time.time(), str(log_path), job_id),
-        )
+            return True
+        # pid only: the state may already have moved on (cancel/restart requests)
+        self.conn.execute("UPDATE jobs SET pid=? WHERE id=?", (proc.pid, job_id))
         self.conn.commit()
         self.running[job_id] = RunningJob(job_id, gpu, proc, log_file, log_path)
         if self.batch_started_at is None:
             self.batch_started_at = time.time()
         self.event(f"job {job_id} started on gpu {gpu}: {shlex.join(argv)}")
+        return True
 
     def dispatch(self, now: float) -> None:
         self.sync_gpus()
@@ -691,15 +803,18 @@ class Scheduler:
         for gpu in self.gpus:
             if gpu in busy:
                 continue
-            if self.paused(time.time()):  # re-check: a spawn failure can pause mid-pass
-                return
-            row = self.conn.execute(
-                "SELECT * FROM jobs WHERE state='queued' ORDER BY rank, id LIMIT 1"
-            ).fetchone()
-            if row is None:
-                return
-            self.spawn(row, gpu)
-            busy.add(gpu)
+            while True:  # a lost claim means the job was just moved: take the next
+                # re-checked every pass: a spawn failure can pause mid-dispatch
+                if self.paused(time.time()):
+                    return
+                row = self.conn.execute(
+                    "SELECT * FROM jobs WHERE state='queued' ORDER BY rank, id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return
+                if self.spawn(row, gpu):
+                    busy.add(gpu)
+                    break
 
     # -- reaping / failure path ----------------------------------------------
     def finalize(self, job_id: int, exit_code: int, log_path: Path) -> None:
@@ -805,7 +920,7 @@ class Scheduler:
         tally = status_tally(self.conn) or "queue is empty"
         notify(f"qsched: {tally}", render_status(False, self.conn), kind="digest")
 
-    def check_drain(self, now: float) -> None:
+    def check_drain(self) -> None:
         """Notify once when the last job of a batch finishes and nothing is left."""
         if self.running or self.batch_started_at is None:
             return
@@ -817,7 +932,11 @@ class Scheduler:
         if pending:
             return
         since, self.batch_started_at = self.batch_started_at, None
-        ctl_set(self.conn, "last_drain_at", str(now))
+        # Read the clock here, after the reaps: the loop's `now` predates them, and
+        # a drain time earlier than the last finished_at puts the status line
+        # above the final job instead of below it.
+        drained_at = time.time()
+        ctl_set(self.conn, "last_drain_at", str(drained_at))
         tally = {
             str(row["state"]): int(row["n"])
             for row in self.conn.execute(
@@ -834,12 +953,21 @@ class Scheduler:
                 (since,),
             )
         ]
+        backlog = int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE state='backlog'"
+            ).fetchone()["n"]
+        )
         summary = ", ".join(
             f"{tally[state]} {state}" for state in TERMINAL_STATES if state in tally
         )
         summary = summary or "no jobs finished"
+        if backlog:
+            summary += f"; {backlog} in backlog"
         self.event(f"queue drained — {summary}")
-        body = f"Ran {_format_age(now - since)}. {summary}.\n"
+        body = f"Ran {_format_age(drained_at - since)}. {summary}.\n"
+        if backlog:
+            body += "  `q release --all` runs the backlog (or `q release <id> ...`)\n"
         if failed_ids:
             ids = ", ".join(str(i) for i in failed_ids)
             body += f"failed ids: {ids}\n  `q fixed <id>` / `q restart --failed`\n"
@@ -918,7 +1046,7 @@ class Scheduler:
                 self.reap()
                 self.process_termination_requests(now)
                 self.dispatch(now)
-                self.check_drain(now)
+                self.check_drain()
                 self.maybe_digest(now)
                 slept = 0.0
                 while slept < POLL_SECONDS and not self.stop_requested:
@@ -1179,8 +1307,81 @@ STATUS_ENV_MAX = 24
 _STATUS_FIXED_WIDTH = 43  # ID through the two spaces after GPU
 STATUS_TABLE_WIDTH = _STATUS_FIXED_WIDTH + STATUS_ENV_MAX + 2 + STATUS_CMD_WIDTH
 
+RUNTIME_SAMPLES = 20  # most recent `done` jobs behind the drain estimate
+MIN_RUNTIME_SAMPLES = 3
 
-def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str:
+
+def typical_runtime(conn: sqlite3.Connection) -> float | None:
+    """Median wall time of the most recent done jobs; None until there is history."""
+    walls = [
+        float(row["wall"])
+        for row in conn.execute(
+            "SELECT finished_at - started_at AS wall FROM jobs WHERE state='done' "
+            "AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT ?",
+            (RUNTIME_SAMPLES,),
+        )
+    ]
+    return statistics.median(walls) if len(walls) >= MIN_RUNTIME_SAMPLES else None
+
+
+def simulate_drain(free_in: list[float], queued: int, duration: float) -> float:
+    """Seconds until `queued` jobs of equal `duration` have all finished.
+
+    `free_in` holds, per GPU slot, the seconds until it is free. Each job takes
+    the slot that frees first (greedy list scheduling), so a nearly empty queue
+    is bounded by its slowest running job rather than spread evenly over GPUs.
+    """
+    slots = list(free_in)
+    heapq.heapify(slots)
+    for _ in range(queued):
+        heapq.heapreplace(slots, slots[0] + duration)
+    return max(slots)
+
+
+def estimate_drain_seconds(conn: sqlite3.Connection, now: float) -> float | None:
+    """Rough seconds until the active queue is empty; None when it can't be said.
+
+    Approximation: every queued job (backlog excluded) takes `typical_runtime`;
+    a running job ends after its tqdm ETA, else after that runtime minus its
+    elapsed time (never below 0). The error grows with the spread of job
+    runtimes; pauses, halts and failure retries are not modeled.
+    """
+    typical = typical_runtime(conn)
+    if typical is None:
+        return None
+    queued = int(
+        conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE state='queued'").fetchone()[
+            "n"
+        ]
+    )
+    running_in: list[float] = []
+    for row in conn.execute(
+        "SELECT started_at, log_path FROM jobs WHERE state='running'"
+    ):
+        progress = tqdm_progress(Path(row["log_path"])) if row["log_path"] else None
+        if progress is not None:
+            running_in.append(progress[1])
+        else:
+            elapsed = now - float(row["started_at"] or now)
+            running_in.append(max(typical - elapsed, 0.0))
+    if not queued and not running_in:
+        return None
+    gpu_slots = len([g for g in ctl_get(conn, "gpus", "").split(",") if g.strip()])
+    free_in = running_in + [0.0] * (gpu_slots - len(running_in))
+    return simulate_drain(free_in, queued, typical) if free_in else None
+
+
+def _finished_by(row: sqlite3.Row, moment: float) -> bool:
+    return row["finished_at"] is not None and float(row["finished_at"]) <= moment
+
+
+def render_status(
+    show_all: bool,
+    conn: sqlite3.Connection | None = None,
+    *,
+    backlog_only: bool = False,
+) -> str:
     """The `q status` view as text — printed by cmd_status, emailed by digests."""
     conn = conn if conn is not None else db()
     now = time.time()
@@ -1198,11 +1399,20 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             f"`q fixed <id>` / `q extend [min]` / `q resume`"
         )
     if summary := status_tally(conn):
+        if (drain := estimate_drain_seconds(conn, now)) is not None:
+            summary += f"  ·  drain ~{_format_age(drain)}"
         lines.append(summary)
-    rows = conn.execute("SELECT * FROM jobs ORDER BY rank, id").fetchall()
-    if not show_all:
-        recent_finished = deque(maxlen=6)
-        active = []
+    if backlog_only:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state='backlog' ORDER BY rank, id"
+        ).fetchall()
+    else:  # the backlog is reached through --backlog only, never through --all
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state != 'backlog' ORDER BY rank, id"
+        ).fetchall()
+    if not show_all and not backlog_only:
+        recent_finished: deque[sqlite3.Row] = deque(maxlen=6)
+        active: list[sqlite3.Row] = []
         for r in rows:
             if r["state"] in ACTIVE_STATES:
                 active.append(r)
@@ -1215,7 +1425,12 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             finished = finished[-3:]
         rows = finished + active
     if not rows:
-        lines.append("queue is empty")
+        if backlog_only:
+            lines.append("backlog is empty")
+        elif parked := status_counts(conn).get("backlog", 0):
+            lines.append(f"queue is empty — {parked} in backlog (`q status --backlog`)")
+        else:
+            lines.append("queue is empty")
         return "\n".join(lines)
 
     common_env, env_rest = _factor_common(
@@ -1275,27 +1490,28 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             f"{row['id']:>5} {row['state']:<9} {row['retries']:>3} "
             f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env}{command}"
         )
-        if last_drain_at > 0 and index < len(rows) - 1:
-            curr_before = (
-                row["finished_at"] is not None
-                and float(row["finished_at"]) <= last_drain_at
-            )
-            next_row = rows[index + 1]
-            next_before = (
-                next_row["finished_at"] is not None
-                and float(next_row["finished_at"]) <= last_drain_at
-            )
-            if curr_before and not next_before:
-                lines.append("-" * STATUS_TABLE_WIDTH)
+        # The line goes right after the last row that predates the last drain, so
+        # it also closes the table when everything shown predates it.
+        is_last = index == len(rows) - 1
+        if (
+            last_drain_at > 0
+            and _finished_by(row, last_drain_at)
+            and (is_last or not _finished_by(rows[index + 1], last_drain_at))
+        ):
+            lines.append("-" * STATUS_TABLE_WIDTH)
     return "\n".join(lines)
+
+
+def status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    return {
+        str(row["state"]): int(row["n"])
+        for row in conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    }
 
 
 def status_tally(conn: sqlite3.Connection) -> str:
     """`queued 41 · running 3  (44 total)`, or empty when there are no jobs."""
-    tally = {
-        str(row["state"]): int(row["n"])
-        for row in conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
-    }
+    tally = status_counts(conn)
     if not tally:
         return ""
     counts = " · ".join(
@@ -1304,8 +1520,8 @@ def status_tally(conn: sqlite3.Connection) -> str:
     return f"{counts}  ({sum(tally.values())} total)"
 
 
-def cmd_status(show_all: bool) -> None:
-    print(render_status(show_all))
+def cmd_status(show_all: bool, *, backlog_only: bool = False) -> None:
+    print(render_status(show_all, backlog_only=backlog_only))
 
 
 def cmd_show(job_id: int, resubmit: bool) -> None:
@@ -1330,18 +1546,73 @@ def cmd_show(job_id: int, resubmit: bool) -> None:
     print(f"cmd: {shlex.join(argv)}")
 
 
-def cmd_logs(job_id: int, follow: bool) -> None:
+ALL_LINES = -1  # `q logs -n all`
+FOLLOW_TAIL_LINES = 50  # what `q logs -f` shows before it starts following
+TAIL_BLOCK_BYTES = 65536
+LINE_BREAK_RE = re.compile(rb"\r\n|\r|\n")  # tqdm redraws with a bare \r
+
+
+def parse_line_count(text: str) -> int:
+    """`-n` value: a non-negative count, or `all`."""
+    if text == "all":
+        return ALL_LINES
+    try:
+        count = int(text)
+    except ValueError:
+        count = -1
+    if count < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a line count or 'all', got {text!r}"
+        )
+    return count
+
+
+def tail_start(handle: IO[bytes], lines: int) -> int:
+    """Offset at which the last `lines` lines of the file begin.
+
+    Reads backwards in blocks, so the cost follows the size of the tail, not of
+    the file. A line ends at LF, CR or CRLF: counting tqdm's bare CR redraws
+    keeps the tail of a progress-bar log small.
+    """
+    size = handle.seek(0, os.SEEK_END)
+    if lines == 0 or size == 0:
+        return size
+    handle.seek(size - 1)
+    # a final terminator ends the last line instead of starting another one
+    needed = lines + (1 if handle.read(1) in (b"\n", b"\r") else 0)
+    pos = size
+    later_starts_with_lf = False
+    while pos > 0:
+        read_size = min(TAIL_BLOCK_BYTES, pos)
+        pos -= read_size
+        handle.seek(pos)
+        block = handle.read(read_size)
+        breaks = list(LINE_BREAK_RE.finditer(block))
+        if later_starts_with_lf and block.endswith(b"\r"):
+            breaks.pop()  # pairs with the \n opening the later block, counted there
+        if len(breaks) >= needed:
+            return pos + breaks[len(breaks) - needed].end()
+        needed -= len(breaks)
+        later_starts_with_lf = block.startswith(b"\n")
+    return 0
+
+
+def cmd_logs(job_id: int, follow: bool, lines: int | None = None) -> None:
     conn = db()
     row = conn.execute("SELECT log_path FROM jobs WHERE id=?", (job_id,)).fetchone()
     if row is None or not row["log_path"]:
         raise SystemExit(f"no log for job {job_id}")
     path = Path(row["log_path"])
     print(f"-- {path}", file=sys.stderr)
+    if lines is None:  # replaying a whole log before following is rarely wanted
+        lines = FOLLOW_TAIL_LINES if follow else ALL_LINES
 
     out = sys.stdout.buffer
     last = b"\n"
     try:
         with open(path, "rb") as handle:
+            if lines != ALL_LINES:
+                handle.seek(tail_start(handle, lines))
             while True:
                 chunk = handle.read(65536)
                 if chunk:
@@ -1363,30 +1634,47 @@ def cmd_logs(job_id: int, follow: bool) -> None:
         out.flush()
 
 
+def cancel_job(conn: sqlite3.Connection, job_id: int) -> str:
+    """Cancel one job; returns the line to print.
+
+    Every UPDATE is conditional on the state just read, so a scheduler pass that
+    moved the job in between is never overwritten: the state is re-read and the
+    right action taken instead.
+    """
+    for _ in range(5):
+        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return f"job {job_id}: not found"
+        state = str(row["state"])
+        if state in ("queued", "backlog"):
+            if conn.execute(
+                "UPDATE jobs SET state='canceled', finished_at=? "
+                "WHERE id=? AND state=?",
+                (time.time(), job_id, state),
+            ).rowcount:
+                return f"job {job_id}: canceled"
+        elif state == "running":
+            if conn.execute(
+                "UPDATE jobs SET state='canceling' WHERE id=? AND state='running'",
+                (job_id,),
+            ).rowcount:
+                return f"job {job_id}: cancel requested (scheduler will SIGTERM)"
+        else:
+            return f"job {job_id}: state {state}, nothing to cancel"
+    return f"job {job_id}: state keeps changing, try again"
+
+
 def cmd_cancel(job_ids: list[int], *, queued: bool = False) -> None:
     conn = db()
     if queued:
         if job_ids:
             raise SystemExit("`q cancel` takes job ids or state, not both")
         rows = conn.execute(
-            f"SELECT id FROM jobs WHERE state='queued' ORDER BY id",
+            "SELECT id FROM jobs WHERE state='queued' ORDER BY id"
         ).fetchall()
         job_ids = [int(row["id"]) for row in rows]
     for job_id in job_ids:
-        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if row is None:
-            print(f"job {job_id}: not found")
-        elif row["state"] == "queued":
-            conn.execute(
-                "UPDATE jobs SET state='canceled', finished_at=? WHERE id=?",
-                (time.time(), job_id),
-            )
-            print(f"job {job_id}: canceled")
-        elif row["state"] == "running":
-            conn.execute("UPDATE jobs SET state='canceling' WHERE id=?", (job_id,))
-            print(f"job {job_id}: cancel requested (scheduler will SIGTERM)")
-        else:
-            print(f"job {job_id}: state {row['state']}, nothing to cancel")
+        print(cancel_job(conn, job_id))
     conn.commit()
 
 
@@ -1419,6 +1707,9 @@ def restart_job(conn: sqlite3.Connection, job_id: int) -> None:
         )
     if state in ("queued", "restarting"):
         print(f"job {job_id}: already {state}, will (re)run")
+        return
+    if state == "backlog":
+        print(f"job {job_id}: in backlog — `q release {job_id}` to queue it")
         return
     conn.execute(
         "UPDATE jobs SET state='queued', retries=0, rank=?, gpu=NULL, pid=NULL, "
@@ -1496,6 +1787,67 @@ def cmd_reorder(job_ids: list[int], to_front: bool) -> None:
         conn.execute("UPDATE jobs SET rank=? WHERE id=?", (rank, job_id))
         print(f"job {job_id}: moved to {'front' if to_front else 'back'}")
     conn.commit()
+
+
+def cmd_backlog(job_ids: list[int]) -> None:
+    conn = db()
+    for job_id in job_ids:
+        # conditional: if the scheduler just started the job, it wins
+        if conn.execute(
+            "UPDATE jobs SET state='backlog' WHERE id=? AND state='queued'", (job_id,)
+        ).rowcount:
+            print(f"job {job_id}: moved to backlog")
+            continue
+        row = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            print(f"job {job_id}: not found")
+        elif row["state"] == "backlog":
+            print(f"job {job_id}: already in backlog")
+        else:
+            print(
+                f"job {job_id}: state {row['state']}, "
+                f"only queued jobs can be backlogged"
+            )
+    conn.commit()
+
+
+def cmd_release(job_ids: list[int], *, release_all: bool) -> None:
+    conn = db()
+    if release_all and job_ids:
+        raise SystemExit("`q release` takes job ids or --all, not both")
+    if not release_all and not job_ids:
+        raise SystemExit("no job ids given — pass ids or --all")
+    if release_all:  # rank order keeps the backlog's own relative order
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE state='backlog' ORDER BY rank, id"
+        ).fetchall()
+        job_ids = [int(row["id"]) for row in rows]
+    next_rank = back_rank(conn)
+    released = 0
+    for job_id in job_ids:  # ascending ranks at the back keep the listed order
+        if conn.execute(
+            "UPDATE jobs SET state='queued', rank=? WHERE id=? AND state='backlog'",
+            (next_rank + released, job_id),
+        ).rowcount:
+            released += 1
+            if not release_all:
+                print(f"job {job_id}: released to back of queue")
+        elif not release_all:
+            row = conn.execute(
+                "SELECT state FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            print(
+                f"job {job_id}: not found"
+                if row is None
+                else f"job {job_id}: state {row['state']}, not in backlog"
+            )
+    conn.commit()
+    if release_all:
+        print(
+            f"released {released} job(s) to back of queue"
+            if released
+            else "backlog is empty"
+        )
 
 
 def cmd_extend(minutes: float) -> None:
@@ -1603,6 +1955,11 @@ def main(argv: list[str] | None = None) -> None:
 
     for p_submit in (p_add, p_sweep):
         p_submit.add_argument(
+            "--backlog",
+            action="store_true",
+            help="enqueue straight into the backlog (not dispatched until released)",
+        )
+        p_submit.add_argument(
             "--validate",
             action="store_true",
             help="probe each job with QSCHED_VALIDATE=1 before enqueuing",
@@ -1624,11 +1981,29 @@ def main(argv: list[str] | None = None) -> None:
     p_gpus.add_argument("spec", nargs="?", default=None, help="GPU ids (e.g. 0,1,2)")
 
     p_status = sub.add_parser("status", help="show the queue")
-    p_status.add_argument("--all", action="store_true")
+    status_view = p_status.add_mutually_exclusive_group()
+    status_view.add_argument("--all", action="store_true")
+    status_view.add_argument(
+        "--backlog", action="store_true", help="show only backlogged jobs"
+    )
 
     p_logs = sub.add_parser("logs", help="print (or follow) a job's log")
     p_logs.add_argument("job_id", type=int)
-    p_logs.add_argument("-f", "--follow", action="store_true")
+    p_logs.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help=f"keep following; starts at the last {FOLLOW_TAIL_LINES} lines "
+        "unless -n is given",
+    )
+    p_logs.add_argument(
+        "-n",
+        "--lines",
+        type=parse_line_count,
+        metavar="N|all",
+        help="print only the last N lines, or `all` "
+        f"(default: all, but {FOLLOW_TAIL_LINES} with -f)",
+    )
 
     p_show = sub.add_parser("show", help="print a job's command, env and cwd")
     p_show.add_argument("job_id", type=int)
@@ -1636,22 +2011,37 @@ def main(argv: list[str] | None = None) -> None:
         "-r", "--resubmit", action="store_true", help="print a paste-able q add line"
     )
 
-    p_cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
-    p_cancel.add_argument("job_ids", type=int, nargs="*")
-    p_cancel.add_argument("--queued", action="store_true")
+    p_cancel = sub.add_parser("cancel", help="cancel queued, backlog or running jobs")
+    p_cancel.add_argument("job_ids", type=parse_id_spec, nargs="*", metavar="ID[-ID]")
+    p_cancel.add_argument(
+        "--queued", action="store_true", help="cancel every queued job (not backlog)"
+    )
 
     p_restart = sub.add_parser("restart", help="rerun running or finished jobs")
-    p_restart.add_argument("job_ids", type=int, nargs="*")
+    p_restart.add_argument("job_ids", type=parse_id_spec, nargs="*", metavar="ID[-ID]")
     for selector in RESTART_SELECTORS:
         p_restart.add_argument(
             f"--{selector}", action="store_true", help=f"restart every {selector} job"
         )
 
     p_front = sub.add_parser("front", help="move queued jobs to the front")
-    p_front.add_argument("job_ids", type=int, nargs="+")
+    p_front.add_argument("job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]")
 
     p_back = sub.add_parser("back", help="move queued jobs to the back")
-    p_back.add_argument("job_ids", type=int, nargs="+")
+    p_back.add_argument("job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]")
+
+    p_backlog = sub.add_parser("backlog", help="park queued jobs in the backlog")
+    p_backlog.add_argument(
+        "job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]"
+    )
+
+    p_release = sub.add_parser(
+        "release", help="move backlog jobs to the back of the queue"
+    )
+    p_release.add_argument("job_ids", type=parse_id_spec, nargs="*", metavar="ID[-ID]")
+    p_release.add_argument(
+        "--all", action="store_true", help="release the whole backlog"
+    )
 
     p_clear = sub.add_parser("clear", help="delete finished jobs and their logs")
     p_clear.add_argument(
@@ -1665,7 +2055,7 @@ def main(argv: list[str] | None = None) -> None:
     p_fixed = sub.add_parser(
         "fixed", help="mark failure fixed: retry at front of queue"
     )
-    p_fixed.add_argument("job_ids", type=int, nargs="+")
+    p_fixed.add_argument("job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]")
 
     p_extend = sub.add_parser("extend", help="extend the failure pause")
     p_extend.add_argument("minutes", type=float, nargs="?", default=5.0)
@@ -1675,31 +2065,43 @@ def main(argv: list[str] | None = None) -> None:
     ns = parser.parse_args(before)
     match ns.cmd:
         case "add":
-            cmd_add(ns.env, command, ns.validate, ns.on_reject)
+            cmd_add(ns.env, command, ns.validate, ns.on_reject, backlog=ns.backlog)
         case "sweep":
-            cmd_sweep(ns.env, command, ns.dry_run, ns.validate, ns.on_reject)
+            cmd_sweep(
+                ns.env,
+                command,
+                ns.dry_run,
+                ns.validate,
+                ns.on_reject,
+                backlog=ns.backlog,
+            )
         case "run":
             cmd_run([int(g) for g in str(ns.gpus).split(",") if g != ""])
         case "gpus":
             cmd_gpus(ns.spec)
         case "status":
-            cmd_status(ns.all)
+            cmd_status(ns.all, backlog_only=ns.backlog)
         case "show":
             cmd_show(ns.job_id, ns.resubmit)
         case "logs":
-            cmd_logs(ns.job_id, ns.follow)
+            cmd_logs(ns.job_id, ns.follow, ns.lines)
         case "cancel":
-            cmd_cancel(ns.job_ids, queued=ns.queued)
+            cmd_cancel(resolve_ids(ns.job_ids), queued=ns.queued)
         case "restart":
-            cmd_restart(ns.job_ids, [s for s in RESTART_SELECTORS if getattr(ns, s)])
+            states = [s for s in RESTART_SELECTORS if getattr(ns, s)]
+            cmd_restart(resolve_ids(ns.job_ids), states)
         case "front":
-            cmd_reorder(ns.job_ids, to_front=True)
+            cmd_reorder(resolve_ids(ns.job_ids), to_front=True)
         case "back":
-            cmd_reorder(ns.job_ids, to_front=False)
+            cmd_reorder(resolve_ids(ns.job_ids), to_front=False)
+        case "backlog":
+            cmd_backlog(resolve_ids(ns.job_ids))
+        case "release":
+            cmd_release(resolve_ids(ns.job_ids), release_all=ns.all)
         case "clear":
             cmd_clear(ns.all, ns.older_than, ns.dry_run)
         case "fixed":
-            cmd_fixed(ns.job_ids)
+            cmd_fixed(resolve_ids(ns.job_ids))
         case "extend":
             cmd_extend(ns.minutes)
         case "resume":
