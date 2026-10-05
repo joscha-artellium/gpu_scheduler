@@ -15,6 +15,7 @@ Commands:
                                                   expand hydra-style sweeps,
                                                   enqueue one job per combo
     q run   [--gpus 0,2,1]                        start the scheduler
+    q gpus  [0,1,2]                               show or update active GPUs
     q status [--all]                              show the queue
     q logs <id> [-f]                              show/follow a job's log
     q show <id> [-r]                              print cmd/env/cwd (-r: q add line)
@@ -612,6 +613,14 @@ class Scheduler:
             return True
         return now < float(ctl_get(self.conn, "pause_until", "0"))
 
+    def sync_gpus(self) -> None:
+        spec = ctl_get(self.conn, "gpus", "")
+        if spec:
+            try:
+                self.gpus = [int(g.strip()) for g in spec.split(",") if g.strip()]
+            except ValueError:
+                pass
+
     # -- startup ------------------------------------------------------------
     def cleanup_stale(self) -> None:
         rows = self.conn.execute(
@@ -677,6 +686,7 @@ class Scheduler:
         self.event(f"job {job_id} started on gpu {gpu}: {shlex.join(argv)}")
 
     def dispatch(self, now: float) -> None:
+        self.sync_gpus()
         busy = {rj.gpu for rj in self.running.values()}
         for gpu in self.gpus:
             if gpu in busy:
@@ -807,6 +817,7 @@ class Scheduler:
         if pending:
             return
         since, self.batch_started_at = self.batch_started_at, None
+        ctl_set(self.conn, "last_drain_at", str(now))
         tally = {
             str(row["state"]): int(row["n"])
             for row in self.conn.execute(
@@ -942,7 +953,9 @@ def cmd_run(gpus: list[int]) -> None:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit("another scheduler is already running for this QSCHED_HOME")
-    scheduler = Scheduler(conn=db(), gpus=gpus)
+    conn = db()
+    ctl_set(conn, "gpus", ",".join(str(g) for g in gpus))
+    scheduler = Scheduler(conn=conn, gpus=gpus)
 
     def _request_stop(signum: int, _frame: Any) -> None:
         scheduler.stop_requested = True
@@ -950,6 +963,34 @@ def cmd_run(gpus: list[int]) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _request_stop)
     scheduler.loop()
+
+
+def cmd_gpus(spec: str | None) -> None:
+    conn = db()
+    if spec is not None:
+        try:
+            gpus = [int(g.strip()) for g in spec.split(",") if g.strip()]
+            if not gpus:
+                raise ValueError
+        except ValueError:
+            raise SystemExit(f"invalid gpu spec: {spec!r} (expected e.g. '0,1,2')")
+        clean_spec = ",".join(str(g) for g in gpus)
+        ctl_set(conn, "gpus", clean_spec)
+        print(f"active GPUs updated to: {clean_spec}")
+    else:
+        current = ctl_get(conn, "gpus", "none")
+        running_rows = conn.execute(
+            "SELECT id, gpu FROM jobs WHERE state='running' AND gpu IS NOT NULL"
+        ).fetchall()
+        busy = {row["gpu"]: row["id"] for row in running_rows}
+        print(f"active GPUs: {current}")
+        if busy:
+            busy_str = ", ".join(
+                f"gpu {gpu} (job {jid})" for gpu, jid in sorted(busy.items())
+            )
+            print(f"currently busy: {busy_str}")
+        else:
+            print("currently busy: none")
 
 
 # ---------------------------------------------------------------- status & friends
@@ -1146,6 +1187,7 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
     lines: list[str] = []
     halted = ctl_get(conn, "halted", "0") == "1"
     pause_until = float(ctl_get(conn, "pause_until", "0"))
+    last_drain_at = float(ctl_get(conn, "last_drain_at", "0"))
     if halted:
         lines.append(
             "!! HALTED (repeated failures) — `q fixed <id> [...]` or `q resume`"
@@ -1233,6 +1275,18 @@ def render_status(show_all: bool, conn: sqlite3.Connection | None = None) -> str
             f"{row['id']:>5} {row['state']:<9} {row['retries']:>3} "
             f"{runtime:>6} {eta:>10} {gpu!s:>3}  {env}{command}"
         )
+        if last_drain_at > 0 and index < len(rows) - 1:
+            curr_before = (
+                row["finished_at"] is not None
+                and float(row["finished_at"]) <= last_drain_at
+            )
+            next_row = rows[index + 1]
+            next_before = (
+                next_row["finished_at"] is not None
+                and float(next_row["finished_at"]) <= last_drain_at
+            )
+            if curr_before and not next_before:
+                lines.append("-" * STATUS_TABLE_WIDTH)
     return "\n".join(lines)
 
 
@@ -1566,6 +1620,9 @@ def main(argv: list[str] | None = None) -> None:
         "--gpus", default="0,1,2", help="GPU ids, in dispatch preference order"
     )
 
+    p_gpus = sub.add_parser("gpus", help="show or update active GPUs")
+    p_gpus.add_argument("spec", nargs="?", default=None, help="GPU ids (e.g. 0,1,2)")
+
     p_status = sub.add_parser("status", help="show the queue")
     p_status.add_argument("--all", action="store_true")
 
@@ -1623,6 +1680,8 @@ def main(argv: list[str] | None = None) -> None:
             cmd_sweep(ns.env, command, ns.dry_run, ns.validate, ns.on_reject)
         case "run":
             cmd_run([int(g) for g in str(ns.gpus).split(",") if g != ""])
+        case "gpus":
+            cmd_gpus(ns.spec)
         case "status":
             cmd_status(ns.all)
         case "show":
