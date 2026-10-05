@@ -990,6 +990,19 @@ def insert_done_job_with_wall_time(
     return job_id
 
 
+def insert_done_job_between(
+    conn: sqlite3.Connection, started_at: float, finished_at: float
+) -> int:
+    job_id = enqueue(conn, "true")
+    conn.execute(
+        "UPDATE jobs SET state='done', exit_code=0, started_at=?, finished_at=? "
+        "WHERE id=?",
+        (started_at, finished_at, job_id),
+    )
+    conn.commit()
+    return job_id
+
+
 def insert_running_job_started_ago(
     conn: sqlite3.Connection, seconds: float, log_path: Path | None = None, gpu: int = 0
 ) -> int:
@@ -1773,28 +1786,28 @@ def test_typical_runtime_needs_three_samples(home: Path) -> None:
 
 def test_typical_runtime_is_the_median_not_the_mean(home: Path) -> None:
     conn = q.db()
-    for wall in (10.0, 20.0, 30.0, 40.0, 10_000.0):
+    for wall in (100.0, 200.0, 300.0, 400.0, 100_000.0):
         insert_done_job_with_wall_time(conn, wall)
-    assert q.typical_runtime(conn) == pytest.approx(30.0)
+    assert q.typical_runtime(conn) == pytest.approx(300.0)
 
 
 def test_typical_runtime_averages_the_middle_pair_for_even_counts(home: Path) -> None:
     conn = q.db()
-    for wall in (10.0, 20.0, 30.0, 40.0):
+    for wall in (100.0, 200.0, 300.0, 400.0):
         insert_done_job_with_wall_time(conn, wall)
-    assert q.typical_runtime(conn) == pytest.approx(25.0)
+    assert q.typical_runtime(conn) == pytest.approx(250.0)
 
 
 def test_typical_runtime_only_looks_at_the_twenty_most_recent_jobs(
     home: Path,
 ) -> None:
     conn = q.db()
-    for index in range(15):  # older history: all very short
-        insert_done_job_with_wall_time(conn, 1.0, finished_ago=1000.0 + index)
-    for index in range(20):  # the window: 9 short, 11 long -> median 100
-        wall = 100.0 if index >= 9 else 1.0
+    for index in range(15):  # older history: all cheap
+        insert_done_job_with_wall_time(conn, 30.0, finished_ago=1000.0 + index)
+    for index in range(20):  # the window: 9 cheap, 11 expensive -> median 300
+        wall = 300.0 if index >= 9 else 30.0
         insert_done_job_with_wall_time(conn, wall, finished_ago=1.0 + index)
-    assert q.typical_runtime(conn) == pytest.approx(100.0)
+    assert q.typical_runtime(conn) == pytest.approx(300.0)
 
 
 def test_typical_runtime_ignores_jobs_that_are_not_cleanly_done(home: Path) -> None:
@@ -1809,6 +1822,71 @@ def test_typical_runtime_ignores_jobs_that_are_not_cleanly_done(home: Path) -> N
     conn.execute("UPDATE jobs SET started_at=NULL WHERE id=?", (never_started,))
     conn.commit()
     assert q.typical_runtime(conn) == pytest.approx(100.0)
+
+
+def test_typical_runtime_excludes_runs_shorter_than_twenty_seconds(home: Path) -> None:
+    conn = q.db()
+    for _ in range(3):
+        insert_done_job_with_wall_time(conn, 100.0)
+    for _ in range(5):  # instant skips: without the rule they would set the median
+        insert_done_job_with_wall_time(conn, 1.0)
+    assert q.typical_runtime(conn) == pytest.approx(100.0)
+
+
+def test_typical_runtime_threshold_is_exactly_twenty_seconds(home: Path) -> None:
+    conn = q.db()
+    for _ in range(3):
+        insert_done_job_between(conn, 1000.0, 1020.0)  # exactly 20 s: counts
+    assert q.typical_runtime(conn) == 20.0
+    for _ in range(3):
+        insert_done_job_between(conn, 2000.0, 2019.99)  # just under: ignored
+    assert q.typical_runtime(conn) == 20.0
+
+
+def test_typical_runtime_needs_three_runs_that_qualify(home: Path) -> None:
+    conn = q.db()
+    for _ in range(2):
+        insert_done_job_with_wall_time(conn, 100.0)
+    for _ in range(10):
+        insert_done_job_with_wall_time(conn, 1.0)
+    assert q.typical_runtime(conn) is None
+
+
+def test_typical_runtime_window_is_filled_with_runs_that_qualify(home: Path) -> None:
+    """Skips are dropped before the window is cut, so they cannot crowd out runs."""
+    conn = q.db()
+    for index in range(10):  # older, expensive
+        insert_done_job_with_wall_time(conn, 1000.0, finished_ago=500.0 + index)
+    for index in range(10):  # newer, cheaper
+        insert_done_job_with_wall_time(conn, 100.0, finished_ago=100.0 + index)
+    for index in range(15):  # the newest of all: instant skips
+        insert_done_job_with_wall_time(conn, 1.0, finished_ago=1.0 + index)
+    # the 20 qualifying runs are ten 100 s and ten 1000 s: median (100 + 1000) / 2
+    assert q.typical_runtime(conn) == pytest.approx(550.0)
+
+
+def test_estimate_drain_ignores_instant_skips_when_judging_cost(home: Path) -> None:
+    conn = q.db()
+    for _ in range(3):
+        insert_done_job_with_wall_time(conn, 100.0)
+    for _ in range(5):
+        insert_done_job_with_wall_time(conn, 1.0)
+    for _ in range(4):
+        enqueue(conn)
+    q.ctl_set(conn, "gpus", "0,1")
+    assert q.estimate_drain_seconds(conn, time.time()) == pytest.approx(200.0)
+
+
+def test_estimate_drain_is_unavailable_when_every_finished_run_was_instant(
+    home: Path,
+) -> None:
+    conn = q.db()
+    for _ in range(10):
+        insert_done_job_with_wall_time(conn, 5.0)
+    enqueue(conn)
+    q.ctl_set(conn, "gpus", "0")
+    assert q.estimate_drain_seconds(conn, time.time()) is None
+    assert "drain" not in q.render_status(False, conn).splitlines()[0]
 
 
 def test_estimate_drain_is_unavailable_without_history(home: Path) -> None:

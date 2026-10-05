@@ -139,12 +139,13 @@ them alone, and `q restart <id>` points you at `q release`.
 
 DRAIN ESTIMATE
 ==============
-Once at least 3 jobs have finished `done`, the status tally ends with
-`drain ~6.2h`. Every queued job (not the backlog) is assumed to take the median
-wall time of the 20 most recent done jobs and goes on whichever GPU frees
-first; running jobs count down from their tqdm ETA, else from that median. The
-error grows with the spread of job runtimes; pauses, halts and failure retries
-are not modeled.
+Once at least 3 `done` runs of 20 s or longer exist, the status tally ends
+with `drain ~6.2h`. Shorter runs (instant skips, cache hits) say nothing about
+what a job costs and are ignored. Every queued job (not the backlog) is assumed
+to take the median wall time of the 20 most recent such runs and goes on
+whichever GPU frees first; running jobs count down from their tqdm ETA, else
+from that median. The error grows with the spread of job runtimes; pauses,
+halts and failure retries are not modeled.
 """
 
 from __future__ import annotations
@@ -1307,19 +1308,25 @@ STATUS_ENV_MAX = 24
 _STATUS_FIXED_WIDTH = 43  # ID through the two spaces after GPU
 STATUS_TABLE_WIDTH = _STATUS_FIXED_WIDTH + STATUS_ENV_MAX + 2 + STATUS_CMD_WIDTH
 
-RUNTIME_SAMPLES = 20  # most recent `done` jobs behind the drain estimate
+RUNTIME_SAMPLES = 20  # most recent qualifying `done` runs behind the estimate
 MIN_RUNTIME_SAMPLES = 3
+MIN_TYPICAL_RUN_SECONDS = 20.0  # shorter runs are skips, not a cost to extrapolate
 
 
 def typical_runtime(conn: sqlite3.Connection) -> float | None:
-    """Median wall time of the most recent done jobs; None until there is history."""
+    """Median wall time of the most recent done runs of at least 20 s.
+
+    Shorter runs are left out before the window is cut, so a burst of instant
+    skips cannot push real runs out of it. None until there is enough history.
+    """
     walls = [
         float(row["wall"])
         for row in conn.execute(
             "SELECT finished_at - started_at AS wall FROM jobs WHERE state='done' "
             "AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND finished_at - started_at >= ? "
             "ORDER BY finished_at DESC LIMIT ?",
-            (RUNTIME_SAMPLES,),
+            (MIN_TYPICAL_RUN_SECONDS, RUNTIME_SAMPLES),
         )
     ]
     return statistics.median(walls) if len(walls) >= MIN_RUNTIME_SAMPLES else None
