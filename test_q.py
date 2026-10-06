@@ -561,9 +561,7 @@ def test_show_reports_env_and_cwd(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     conn = q.db()
-    (job,) = q.insert_jobs(
-        conn, [["python", "train.py", "model=a"]], {"REGION": "US3"}
-    )
+    (job,) = q.insert_jobs(conn, [["python", "train.py", "model=a"]], {"REGION": "US3"})
     q.cmd_show(job, resubmit=False)
     out = capsys.readouterr().out
     assert "env: REGION=US3" in out
@@ -764,8 +762,8 @@ def test_probe_env_hides_gpus_and_carries_job_env(home: Path) -> None:
     argv = [
         "sh",
         "-c",
-        f'echo "V=$QSCHED_VALIDATE CUDA=[$CUDA_VISIBLE_DEVICES] R=$REGION P=$PWD"; '
-        f"exit 1",
+        'echo "V=$QSCHED_VALIDATE CUDA=[$CUDA_VISIBLE_DEVICES] R=$REGION P=$PWD"; '
+        "exit 1",
     ]
     result = run_probe(argv, {"REGION": "US3"}, str(home))
     assert f"V=1 CUDA=[] R=US3 P={home}" in result.output

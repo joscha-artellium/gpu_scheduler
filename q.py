@@ -2038,9 +2038,7 @@ def main(argv: list[str] | None = None) -> None:
     p_back.add_argument("job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]")
 
     p_backlog = sub.add_parser("backlog", help="park queued jobs in the backlog")
-    p_backlog.add_argument(
-        "job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]"
-    )
+    p_backlog.add_argument("job_ids", type=parse_id_spec, nargs="+", metavar="ID[-ID]")
 
     p_release = sub.add_parser(
         "release", help="move backlog jobs to the back of the queue"
