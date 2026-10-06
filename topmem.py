@@ -2,7 +2,10 @@
 import glob
 import os
 import re
+import shutil
+import subprocess
 import sys
+from typing import NamedTuple
 
 # --- Color Configuration (Standard Library Only) ---
 USE_COLOR = sys.stdout.isatty()
@@ -24,11 +27,14 @@ BOLD_WHITE = "\033[1;37m" if USE_COLOR else ""
 
 # --- Memory summary layout ---
 KIB_PER_GIB = 1024 * 1024
+KIB_PER_MIB = 1024
 BAR_WIDTH = 40
 LABEL_WIDTH = 6
 WARN_FRACTION = 0.60
 CRITICAL_FRACTION = 0.85
 ANSI_ESCAPE = re.compile(r"\033\[[0-9;]*m")
+# nvidia-smi can hang on a wedged driver; this bounds the worst-case startup delay.
+GPU_QUERY_TIMEOUT_S = 5.0
 
 # Processes that act as containers/supervisors for separate user workloads
 BOUNDARIES = {
@@ -44,6 +50,12 @@ BOUNDARIES = {
     # Interactive Shells
     "bash",
 }
+
+
+class GpuMemory(NamedTuple):
+    index: int
+    used_kib: int
+    total_kib: int
 
 
 def is_boundary(pdata):
@@ -71,6 +83,42 @@ def get_meminfo() -> dict[str, int]:
             key, _, rest = line.partition(":")
             info[key] = int(rest.split()[0])
     return info
+
+
+def get_gpu_memory() -> list[GpuMemory]:
+    """Per-GPU memory from nvidia-smi; empty if unavailable or unparsable."""
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603
+            [
+                executable,
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GPU_QUERY_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    gpus: list[GpuMemory] = []
+    for line in result.stdout.splitlines():
+        try:
+            index, used_mib, total_mib = (int(f) for f in line.split(","))
+        except ValueError:
+            # Wrong field count, or "[N/A]" (e.g. unified-memory devices).
+            continue
+        if total_mib > 0:
+            gpus.append(
+                GpuMemory(index, used_mib * KIB_PER_MIB, total_mib * KIB_PER_MIB)
+            )
+    return gpus
 
 
 def visible_len(text: str) -> int:
@@ -109,7 +157,7 @@ def usage_line(label: str, bar: str, used: int, total: int, color: str) -> str:
     )
 
 
-def print_memory_summary(meminfo: dict[str, int]) -> None:
+def print_memory_summary(meminfo: dict[str, int], gpus: list[GpuMemory]) -> None:
     total = meminfo["MemTotal"]
     free = meminfo["MemFree"]
     # Pre-3.14 kernels lack MemAvailable; fall back to "used = total - free".
@@ -149,6 +197,16 @@ def print_memory_summary(meminfo: dict[str, int]) -> None:
         lines.append(usage_line("Swap", swap_bar, swap_used, swap_total, swap_color))
 
     width = max(visible_len(line) for line in lines)
+    if gpus:
+        lines.append(f"{DIM}{'-' * width}{RESET}")
+    for gpu in gpus:
+        used_kib, total_kib = gpu.used_kib, gpu.total_kib
+        gpu_color = utilization_color(used_kib / total_kib)
+        gpu_bar = render_bar(used_kib, 0, total_kib, gpu_color)
+        lines.append(
+            usage_line(f"GPU{gpu.index}", gpu_bar, used_kib, total_kib, gpu_color)
+        )
+
     print(f"{DIM}{'=' * width}{RESET}")
     print(f"{BOLD_CYAN}MEMORY UTILIZATION{RESET}")
     print(f"{DIM}{'-' * width}{RESET}")
@@ -362,9 +420,9 @@ def main():
         kb_to_gb=KB_TO_GB,
     )
 
-    # 5. Memory summary
+    # 5. Memory summary (RAM, swap, then one bar per GPU if nvidia-smi works)
     print()
-    print_memory_summary(get_meminfo())
+    print_memory_summary(get_meminfo(), get_gpu_memory())
     print()
 
 
