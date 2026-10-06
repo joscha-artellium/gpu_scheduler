@@ -1308,8 +1308,8 @@ STATUS_ENV_MAX = 24
 _STATUS_FIXED_WIDTH = 43  # ID through the two spaces after GPU
 STATUS_TABLE_WIDTH = _STATUS_FIXED_WIDTH + STATUS_ENV_MAX + 2 + STATUS_CMD_WIDTH
 
-RUNTIME_SAMPLES = 20  # most recent qualifying `done` runs behind the estimate
-MIN_RUNTIME_SAMPLES = 3
+RUNTIME_SAMPLES = 25  # most recent qualifying `done` runs behind the estimate
+MIN_RUNTIME_SAMPLES = 2
 MIN_TYPICAL_RUN_SECONDS = 20.0  # shorter runs are skips, not a cost to extrapolate
 
 
