@@ -1147,20 +1147,26 @@ def _parse_hms(value: str) -> float:
     return seconds
 
 
-def tqdm_progress(path: Path, max_bytes: int = 512) -> tuple[int, float] | None:
-    """(percent, seconds remaining) from the last complete tqdm bar in the tail."""
+def tqdm_progress(
+    path: Path, max_bytes: int = 512
+) -> tuple[None, None] | tuple[int, float | None]:
+    """(percent, seconds remaining) from the newest tqdm bar line in the tail.
+
+    Seconds remaining is None while tqdm has no rate estimate yet (rendered '?').
+    """
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             handle.seek(max(0, handle.tell() - max_bytes))
             tail = handle.read().decode(errors="replace")
     except OSError:
-        return None
+        return None, None
     for chunk in reversed(re.split(r"[\r\n]", tail)):
-        match = TQDM_RE.search(chunk)
-        if match and match["remaining"] != "?":
-            return int(match["pct"]), _parse_hms(match["remaining"])
-    return None
+        if (match := TQDM_RE.search(chunk)) is None:
+            continue
+        eta = match["remaining"]
+        return int(match["pct"]), None if eta == "?" else _parse_hms(eta)
+    return None, None
 
 
 _KV_TOKEN = re.compile(r"^[+~]?[\w.@/-]+=")
@@ -1366,9 +1372,9 @@ def estimate_drain_seconds(conn: sqlite3.Connection, now: float) -> float | None
     for row in conn.execute(
         "SELECT started_at, log_path FROM jobs WHERE state='running'"
     ):
-        progress = tqdm_progress(Path(row["log_path"])) if row["log_path"] else None
-        if progress is not None:
-            running_in.append(progress[1])
+        remaining = tqdm_progress(Path(row["log_path"]))[1] if row["log_path"] else None
+        if remaining is not None:
+            running_in.append(remaining)
         else:
             elapsed = now - float(row["started_at"] or now)
             running_in.append(max(typical - elapsed, 0.0))
@@ -1482,10 +1488,10 @@ def render_status(
             runtime = "-"
         eta = "-"
         if live and row["log_path"]:
-            progress = tqdm_progress(Path(row["log_path"]))
-            if progress is not None:
-                percent, remaining = progress
-                eta = f"{percent}% {_format_age(remaining)}"
+            percent, remaining = tqdm_progress(Path(row["log_path"]))
+            if percent is not None:
+                age = _format_age(remaining) if remaining is not None else ""
+                eta = f"{percent}% {age}"
         command = _clip_tokens(cmd_rest[index], cmd_width, " ")
         env = (
             f"{_clip_tokens(env_rest[index], env_width, ','):<{env_width}}  "

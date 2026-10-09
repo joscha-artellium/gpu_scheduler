@@ -159,7 +159,7 @@ def test_no_expansion_is_single_job() -> None:
     ]
 
 
-BAR = "predict:  83%|████████▎ | 38/46 [3:13:17<58:20, 437.56s/it]"
+TQDM_PREDICT_BAR = "predict:  83%|████████▎ | 38/46 [3:13:17<58:20, 437.56s/it]"
 
 
 def test_parse_hms() -> None:
@@ -168,7 +168,7 @@ def test_parse_hms() -> None:
     assert _parse_hms("07") == 7.0
 
 
-def _log(tmp_path: Path, text: str) -> Path:
+def _write_tqdm_log(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "1.log"
     path.write_text(text, encoding="utf-8")
     return path
@@ -176,27 +176,31 @@ def _log(tmp_path: Path, text: str) -> Path:
 
 def test_tqdm_progress_reads_last_bar(tmp_path: Path) -> None:
     text = "== header\n" + "\r".join(
-        ["fit:   5%|▌ | 1/20 [00:10<03:10, 10.0s/it]", BAR]
+        ["fit:   5%|▌ | 1/20 [00:10<03:10, 10.0s/it]", TQDM_PREDICT_BAR]
     )
-    assert tqdm_progress(_log(tmp_path, text)) == (83, 3500.0)
+    assert tqdm_progress(_write_tqdm_log(tmp_path, text)) == (83, 3500.0)
 
 
-def test_tqdm_progress_ignores_unknown_eta(tmp_path: Path) -> None:
+def test_tqdm_progress_newest_bar_with_unknown_eta_wins(tmp_path: Path) -> None:
     unknown = "predict:   0%|  | 0/46 [00:00<?, ?it/s]"
-    assert tqdm_progress(_log(tmp_path, f"{BAR}\r{unknown}")) == (83, 3500.0)
+    path = _write_tqdm_log(tmp_path, f"{TQDM_PREDICT_BAR}\r{unknown}")
+    assert tqdm_progress(path) == (0, None)
 
 
 def test_tqdm_progress_without_bar(tmp_path: Path) -> None:
-    assert tqdm_progress(_log(tmp_path, "epoch 3 loss 0.1\n")) is None
-    assert tqdm_progress(tmp_path / "missing.log") is None
+    path = _write_tqdm_log(tmp_path, "epoch 3 loss 0.1\n")
+    assert tqdm_progress(path) == (None, None)
+    assert tqdm_progress(tmp_path / "missing.log") == (None, None)
 
 
 def test_tqdm_progress_ignores_totalless_bar(tmp_path: Path) -> None:
-    assert tqdm_progress(_log(tmp_path, "38it [03:13, 5.09s/it]\n")) is None
+    path = _write_tqdm_log(tmp_path, "38it [03:13, 5.09s/it]\n")
+    assert tqdm_progress(path) == (None, None)
 
 
 def test_tqdm_progress_only_reads_tail(tmp_path: Path) -> None:
-    assert tqdm_progress(_log(tmp_path, BAR + "\n" + "x" * 8192)) is None
+    path = _write_tqdm_log(tmp_path, TQDM_PREDICT_BAR + "\n" + "x" * 8192)
+    assert tqdm_progress(path) == (None, None)
 
 
 # ------------------------------------------------------------ failure semantics
@@ -1773,9 +1777,9 @@ def test_simulate_drain_does_not_mutate_its_input() -> None:
     assert free_in == [10.0, 0.0]
 
 
-def test_typical_runtime_needs_three_samples(home: Path) -> None:
+def test_typical_runtime_needs_n_samples(home: Path) -> None:
     conn = q.db()
-    for _ in range(2):
+    for _ in range(q.MIN_RUNTIME_SAMPLES - 1):
         insert_done_job_with_wall_time(conn, 100.0)
     assert q.typical_runtime(conn) is None
     insert_done_job_with_wall_time(conn, 100.0)
@@ -1796,13 +1800,15 @@ def test_typical_runtime_averages_the_middle_pair_for_even_counts(home: Path) ->
     assert q.typical_runtime(conn) == pytest.approx(250.0)
 
 
-def test_typical_runtime_only_looks_at_the_twenty_most_recent_jobs(
+def test_typical_runtime_only_looks_at_the_n_most_recent_jobs(
     home: Path,
 ) -> None:
     conn = q.db()
-    for index in range(15):  # older history: all cheap
+    # older history: all cheap
+    for index in range(q.RUNTIME_SAMPLES):
         insert_done_job_with_wall_time(conn, 30.0, finished_ago=1000.0 + index)
-    for index in range(20):  # the window: 9 cheap, 11 expensive -> median 300
+    # the window: 9 cheap, 11 expensive -> median 300
+    for index in range(q.RUNTIME_SAMPLES):
         wall = 300.0 if index >= 9 else 30.0
         insert_done_job_with_wall_time(conn, wall, finished_ago=1.0 + index)
     assert q.typical_runtime(conn) == pytest.approx(300.0)
@@ -1841,9 +1847,9 @@ def test_typical_runtime_threshold_is_exactly_twenty_seconds(home: Path) -> None
     assert q.typical_runtime(conn) == 20.0
 
 
-def test_typical_runtime_needs_three_runs_that_qualify(home: Path) -> None:
+def test_typical_runtime_needs_n_runs_that_qualify(home: Path) -> None:
     conn = q.db()
-    for _ in range(2):
+    for _ in range(q.MIN_RUNTIME_SAMPLES - 1):
         insert_done_job_with_wall_time(conn, 100.0)
     for _ in range(10):
         insert_done_job_with_wall_time(conn, 1.0)
